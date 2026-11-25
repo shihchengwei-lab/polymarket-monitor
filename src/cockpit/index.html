@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NegRisk · 行情觀測站</title><link rel="stylesheet" href="/style.css"><script src="/visuals.js" defer></script><script src="/app.js" defer></script></head>
+<body><header><div class="brand"><b>∿</b> NegRisk <span>/</span> Cockpit</div><label class="file">載入紙上回放<input id="file" type="file" accept=".json"></label></header><main>
+<div class="eyebrow">MARKET MONITOR</div><h1 id="title">行情觀測站</h1>
+<form id="eventForm"><label>熱門 NegRisk 事件 · 24h 成交量<select id="popular"><option value="">載入清單中…</option></select></label>
+<label>事件 slug<input id="eventSlug" type="text" required maxlength="256" pattern="[a-zA-Z0-9_\-]+" autocomplete="off" spellcheck="false" placeholder="貼上事件 slug"></label><button id="switchEvent">切換事件</button></form>
+<p class="session-hint">切換後，所有分頁將共用新場次，紙上帳戶重設為 1,000 pUSD 空倉。 <output id="eventMessage" role="status"></output></p>
+<div class="toolbar"><button id="live">即時盤面</button><button id="history">盤面回看</button><button id="paper" disabled>紙上回放</button><output id="status" aria-live="polite">連線中</output></div>
+<p id="notice" role="status"></p>
+<div id="basketVisuals">
+<section id="trend"><div class="panel-head"><div><h2>整籃含費買入成本</h2><small>各選項一股 YES · Taker 最佳賣價 · 最近 60 秒</small></div><div class="readout"><strong id="basketCost">—</strong><span id="edgeState">等待行情</span></div></div>
+<canvas id="costChart" role="img" aria-label="整籃成本走勢，紅線為一美元"></canvas>
+<div class="legend"><span>◆ 掛單</span><span>● 部分成交／成交</span><span>× 撤單</span><span>▲ 補腿</span></div>
+<details><summary>視窗內的模擬事件</summary><ol id="chartEvents"></ol></details></section>
+<section><div class="panel-head"><div><h2>湊套平衡格</h2><small>各選項紙上持股 · 氣泡為公開成交</small></div><output id="alignState">等待帳本</output></div>
+<div id="slots"></div><div id="queueMeter" hidden><label for="queueProgress" id="queueLabel"></label><progress id="queueProgress" max="100" value="0"></progress></div></section></div>
+<div class="metrics"><article><label id="la"></label><strong id="a"></strong></article><article><label id="lb"></label><strong id="b"></strong></article><article><label id="lc"></label><strong id="c"></strong></article></div>
+<section id="timeline" hidden><button id="play">播放</button><input id="time" type="range" min="0" value="0" aria-label="回放位置"><output id="at"></output></section>
+<section id="bookPanel"><h2 id="heading">最佳買賣盤</h2><div class="scroll"><table><thead id="cols"></thead><tbody id="rows"></tbody></table></div><p id="empty"></p></section>
+<section id="queue"><h2>買一隊列</h2><label>追蹤價位 <select id="track" aria-label="追蹤買一隊列"></select></label><p id="queueInfo"></p></section>
+<section id="controls"><h2>即時紙上模擬</h2>
+<div class="desk-controls"><label>單程延遲 <output id="ms">150 ms</output><input id="lag" type="range" min="0" max="300" value="150" step="1"></label>
+<label>策略 <select id="strategy"><option value="off">純監控</option><option value="on">Maker-First 閘門掛單</option></select></label>
+<button id="fire" title="單輪略過正價差門檻，仍需有效報價、足夠股數及現金">強制試射一輪 25 股</button></div>
+<p id="deskState">等待紙上引擎</p><output id="answer" role="status"></output><ol id="actions"></ol></section>
+<section><h2>狀態轉換</h2><ol id="log"></ol></section><section id="ledger"><h2>模擬帳本 <small>pUSD</small></h2><div class="ledger-grid"><div>可用現金<strong id="cash">—</strong></div><div>凍結額度<strong id="frozenCash">—</strong></div><div>買價估值損益<strong id="pnl">—</strong></div><div>資金與股份守恆<strong id="conservation">—</strong></div></div><p id="positions"></p></section></main></body></html>
