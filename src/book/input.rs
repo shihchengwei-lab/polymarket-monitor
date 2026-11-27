@@ -165,7 +165,7 @@ impl<'a> Retirement<'a> {
             self.fault = Some(anyhow::anyhow!("crossed book reconciliation timed out"));
         }
         let ready = if matches!(self.end, End::Once) && self.fault.is_none() {
-            if self.group.ready() {
+            if self.group.quotes_ready() {
                 Some(self.group.render())
             } else {
                 self.fault = Some(anyhow::anyhow!(

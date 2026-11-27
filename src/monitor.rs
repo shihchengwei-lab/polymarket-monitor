@@ -472,10 +472,10 @@ async fn session(
             break Cutoff::ReconcileDeadline;
         }
         group.expire_snapshots();
-        if once && group.ready() {
+        if once && group.quotes_ready() {
             break Cutoff::Once(source);
         }
-        let current_ready = group.ready();
+        let current_ready = group.quotes_ready();
         render |= ready != current_ready;
         ready = current_ready;
         if !group.has_open_assets() {

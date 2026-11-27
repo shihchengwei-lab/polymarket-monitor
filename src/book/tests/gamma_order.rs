@@ -77,6 +77,65 @@ async fn followed_redirect_keeps_raw_gamma_fields_and_renders_each_on_one_line()
     assert!(view.lines().any(|line| line == r"市場\n問題"));
 }
 
+#[tokio::test]
+async fn augmented_event_syncs_named_quotes_without_enabling_a_basket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut group = NegRiskEventGroup::new("fixture");
+    let mut event: serde_json::Value = serde_json::from_str(GAMMA_FIXTURE).unwrap();
+    event["negRiskAugmented"] = true.into();
+    let markets = event["markets"].as_array_mut().unwrap();
+    for market in markets.iter_mut() {
+        market["active"] = true.into();
+        market["negRiskOther"] = false.into();
+    }
+    let mut extra = markets[0].clone();
+    extra["question"] = "Candidate A".into();
+    extra["conditionId"] = "c".into();
+    extra["clobTokenIds"] = serde_json::json!(["5", "6"]);
+    extra["active"] = false.into();
+    markets.push(extra.clone());
+    extra["question"] = "Other".into();
+    extra["conditionId"] = "d".into();
+    extra["clobTokenIds"] = serde_json::json!(["7", "8"]);
+    extra["active"] = true.into();
+    extra["negRiskOther"] = true.into();
+    markets.push(extra);
+
+    let (outcome, ()) = tokio::join!(
+        group.refresh_discovery(&client, &base, Duration::from_secs(30)),
+        async {
+            let (socket, _) = http_request(&listener).await;
+            http_response(socket, &event.to_string()).await;
+        }
+    );
+    assert!(outcome.unwrap());
+    assert_eq!(
+        group.subscription().unwrap().into_parts().0,
+        ["1", "2", "3", "4"]
+    );
+    let source = group.open_input().unwrap();
+    for (asset, market) in [("1", "a"), ("2", "a"), ("3", "b"), ("4", "b")] {
+        assert!(!group.quotes_ready());
+        assert!(
+            group
+                .admit_raw(source, snapshot(asset, market, 100))
+                .unwrap()
+        );
+        assert!(group.advance_input(source).unwrap());
+    }
+    assert!(group.quotes_ready());
+    assert!(!group.ready());
+    assert!(group.buy_depth(25.into()).is_none());
+    assert!(group.command_frontier().is_none());
+    let view = group.render();
+    assert!(view.contains("QuotesReady (2/2"));
+    assert!(view.contains("YES 中間價總和 —"));
+    assert!(view.contains("bid 0.4"));
+    assert!(!view.contains("Candidate A") && !view.contains("Other"));
+}
+
 fn sync(group: &mut NegRiskEventGroup, source: SubscriptionId) {
     for (asset, market) in [("1", "a"), ("2", "a"), ("3", "b"), ("4", "b")] {
         assert!(

@@ -2,7 +2,7 @@
 
 Polymarket lists each outcome of a multi-outcome event in a separate order book. NegRisk Monitor brings those books into one local dashboard so you can see what it costs to buy one YES share per outcome. A complete set pays out 1 pUSD. The dashboard tracks the cost against that payout, including taker fees when a verified fee rate is available.
 
-Use public market data to simulate orders, queueing, cancellations, and fills on the remaining outcomes. Orders and balances stay in the local simulator.
+Use public market data to simulate orders, queueing, cancellations, and fills on the remaining outcomes. Orders and balances stay in the local simulator. For augmented NegRisk events, the dashboard shows active named outcomes in quote-only mode. Basket metrics and paper trading require the complete set of outcomes.
 
 ## Quick start
 

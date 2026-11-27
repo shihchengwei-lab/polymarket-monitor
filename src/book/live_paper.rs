@@ -26,7 +26,9 @@ impl LivePaper {
     pub(super) fn publish(&mut self, group: &NegRiskEventGroup) {
         self.clock(Instant::now());
         let Some(source) = group.source().filter(|_| {
-            !group.event_closed() && group.markets().iter().all(|m| !group.market_closed(m))
+            !group.quotes_only()
+                && !group.event_closed()
+                && group.markets().iter().all(|m| !group.market_closed(m))
         }) else {
             self.exchange.retire_live_group();
             return;

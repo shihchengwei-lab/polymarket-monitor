@@ -17,7 +17,7 @@ const HELP: &str = "Polymarket NegRisk 唯讀監控
 
 list  從 Gamma 列出這一頁的開放 NegRisk 事件。預設每頁 100 筆，從第 0 筆開始。
 watch 顯示指定事件的訂單簿。按 Ctrl+C 結束。
---once 在首個 Ready 畫面寫入成功後結束。同步或輸出失敗時回傳錯誤。";
+--once 在首個已同步的畫面寫入成功後結束。同步或輸出失敗時回傳錯誤。";
 
 #[tokio::main]
 async fn main() -> ExitCode {

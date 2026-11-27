@@ -45,7 +45,7 @@ function decimal(v) {
 }
 function market(screen) {
   const lines = screen.book.split("\n");
-  const head = /^(.*) \| (Ready|NotReady) \((\d+\/\d+) 子市場\)$/.exec(lines[0]);
+  const head = /^(.*) \| (Ready|QuotesReady|NotReady) \((\d+\/\d+) 子市場\)$/.exec(lines[0]);
   const summary = lines.findIndex(s => s.startsWith("YES 中間價總和 "));
   const rows=[], states=new Map();
   let name="", askSum=0n, bidSum=0n, feeSum=0n, depthOk=true, bidsOk=true, feesOk=true, complete=!!head && head[2]==="Ready", yesCount=0;
@@ -111,7 +111,7 @@ function showBook(frame, frames, index) {
   const m=market(screen);
   put("title",m.title || screen.slug || "行情觀測站");
   put("heading","最佳買賣盤");
-  put("status",mode==="history"?"盤面回看":!connected?"本機服務離線":screen.stopped?"行情已停止":m.status || "等待行情");
+  put("status",mode==="history"?"盤面回看":!connected?"本機服務離線":screen.stopped?"行情已停止":(m.status==="QuotesReady"?"報價已同步":m.status) || "等待行情");
   const active=mode==="history" || connected;
   el("queue").hidden=false;queueView(m,active && !screen.stopped);
   metrics(["Taker 毛價差 · 最佳賣價","Taker 淨價差 · 每腿 1 股扣費後","Maker 空間 · 1 − 最佳買價總和"],active?[m.edge,m.net,m.maker]:[none,none,none]);

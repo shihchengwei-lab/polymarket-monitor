@@ -651,12 +651,13 @@ impl Market {
 
 #[derive(Default)]
 struct Roster {
+    quotes_only: bool,
     markets: Vec<Market>,
     by_asset: BTreeMap<String, (usize, Outcome)>,
 }
 
 impl Roster {
-    fn new(specs: Vec<crate::gamma_discovery::MarketSpec>) -> Self {
+    fn new(specs: Vec<crate::gamma_discovery::MarketSpec>, quotes_only: bool) -> Self {
         let markets: Vec<_> = specs
             .into_iter()
             .map(|spec| {
@@ -681,7 +682,11 @@ impl Roster {
                 ]
             })
             .collect();
-        Self { markets, by_asset }
+        Self {
+            quotes_only,
+            markets,
+            by_asset,
+        }
     }
 
     fn market_index(&self, condition: &str) -> Option<usize> {
@@ -691,7 +696,8 @@ impl Roster {
     }
 
     fn matches(&self, spec: &GroupSpec, resolved: &HashSet<String>) -> bool {
-        spec.markets().len() == self.markets.len()
+        spec.quotes_only() == self.quotes_only
+            && spec.markets().len() == self.markets.len()
             && spec
                 .markets()
                 .iter()
@@ -991,7 +997,7 @@ impl NegRiskEventGroup {
         let Membership::Open { roster, .. } = &mut self.membership else {
             return;
         };
-        if roster.markets.len() > crate::paper::chaos_exchange::MAX_ASSETS {
+        if roster.quotes_only || roster.markets.len() > crate::paper::chaos_exchange::MAX_ASSETS {
             return;
         }
         for market in &mut roster.markets {
@@ -1190,9 +1196,19 @@ impl NegRiskEventGroup {
                 .all(|book| book.synced().is_some())
     }
 
-    pub fn ready(&self) -> bool {
+    fn quotes_only(&self) -> bool {
+        self.roster().is_some_and(|roster| roster.quotes_only)
+    }
+
+    /// All monitored YES and NO books are synchronized.
+    pub fn quotes_ready(&self) -> bool {
         matches!(&self.membership, Membership::Open { roster, .. }
             if roster.markets.iter().all(|market| self.market_synced(market)))
+    }
+
+    /// The full event basket is eligible for aggregation and paper simulation.
+    pub fn ready(&self) -> bool {
+        self.quotes_ready() && !self.quotes_only()
     }
 
     /// Transfers exclusive ownership of an unused paper exchange to this feed.
@@ -1450,10 +1466,11 @@ impl NegRiskEventGroup {
         let roster = self.take_roster();
         self.membership = match next {
             Discovery::Open(spec) => {
+                let quotes_only = spec.quotes_only();
                 let (title, specs, valid_until) = spec.into_parts();
                 self.title = title;
                 Membership::Open {
-                    roster: Roster::new(specs),
+                    roster: Roster::new(specs, quotes_only),
                     valid_until,
                 }
             }
@@ -1599,8 +1616,15 @@ impl NegRiskEventGroup {
             .iter()
             .filter(|market| self.market_synced(market))
             .count();
-        let ready = matches!(self.membership, Membership::Open { .. }) && synced == markets.len();
-        let status = if ready { "Ready" } else { "NotReady" };
+        let quotes_ready =
+            matches!(self.membership, Membership::Open { .. }) && synced == markets.len();
+        let quotes_only = self.quotes_only();
+        let ready = quotes_ready && !quotes_only;
+        let status = match (quotes_ready, quotes_only) {
+            (true, false) => "Ready",
+            (true, true) => "QuotesReady",
+            (false, _) => "NotReady",
+        };
         let mut output = format!(
             "{} | {status} ({synced}/{} 子市場)\n",
             single_line(&self.title),
@@ -1628,6 +1652,12 @@ impl NegRiskEventGroup {
                 "使用上次確認的資料"
             };
             let _ = writeln!(output, "Gamma 更新失敗，{status}");
+        }
+        if quotes_only {
+            let _ = writeln!(
+                output,
+                "此事件只顯示已啟用的具名選項；整籃計算與紙上交易已停用"
+            );
         }
         let sum = self.yes_sum(ready).map_or_else(
             || "—".to_owned(),
@@ -1664,7 +1694,7 @@ impl NegRiskEventGroup {
                 }
                 let _ = writeln!(output);
             }
-            if ready {
+            if quotes_ready {
                 let gap = Self::midpoint(&market.yes)
                     .zip(Self::midpoint(&market.no))
                     .map_or_else(

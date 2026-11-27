@@ -56,6 +56,10 @@ async fn roster(client: &Client, slug: &str, gamma: &str, clob: &str) -> Result<
     else {
         anyhow::bail!("事件未開放")
     };
+    ensure!(
+        !group.quotes_only(),
+        "此事件僅提供具名選項報價，紙上交易已停用"
+    );
     let specs = group.into_parts().1;
     ensure!(specs.len() <= 64, "紙上引擎最多支援 64 腿");
     let mut legs = Vec::new();

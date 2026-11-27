@@ -19,6 +19,7 @@ struct EventRecord {
     title: String,
     #[serde(default)]
     neg_risk: Option<bool>,
+    neg_risk_augmented: Option<bool>,
     markets: Vec<MarketRecord>,
 }
 
@@ -34,6 +35,8 @@ struct MarketRecord {
     #[serde(deserialize_with = "gamma_decimal")]
     order_price_min_tick_size: Decimal,
     closed: bool,
+    active: Option<bool>,
+    neg_risk_other: Option<bool>,
 }
 
 fn string_array<'de, D: Deserializer<'de>>(input: D) -> Result<Vec<String>, D::Error> {
@@ -80,9 +83,14 @@ pub struct GroupSpec {
     title: String,
     markets: Vec<MarketSpec>,
     valid_until: Instant,
+    quotes_only: bool,
 }
 
 impl GroupSpec {
+    pub(crate) fn quotes_only(&self) -> bool {
+        self.quotes_only
+    }
+
     pub fn markets(&self) -> &[MarketSpec] {
         &self.markets
     }
@@ -123,7 +131,12 @@ impl EventRecord {
         let mut conditions = HashSet::new();
         let mut tokens = HashSet::new();
         let mut markets = Vec::new();
+        let quotes_only = self.neg_risk_augmented == Some(true);
         for market in self.markets {
+            if quotes_only && (market.active != Some(true) || market.neg_risk_other != Some(false))
+            {
+                continue;
+            }
             ensure!(
                 !market.condition_id.is_empty() && conditions.insert(market.condition_id.clone()),
                 "empty or duplicate condition ID in {}",
@@ -160,11 +173,17 @@ impl EventRecord {
                 closed: market.closed,
             });
         }
+        ensure!(
+            !markets.is_empty(),
+            "{} has no named active markets",
+            self.slug
+        );
         markets.sort_unstable_by(|a, b| a.condition.cmp(&b.condition));
         Ok(GroupSpec {
             title: self.title,
             markets,
             valid_until,
+            quotes_only,
         })
     }
 }
@@ -212,6 +231,7 @@ pub(crate) fn fixture_spec(markets: &[(&str, &str, &str, Decimal, bool)]) -> Gro
         slug: "fixture".to_owned(),
         title: "Fixture".to_owned(),
         neg_risk: Some(true),
+        neg_risk_augmented: None,
         markets: markets
             .iter()
             .map(|&(condition, yes, no, tick, closed)| MarketRecord {
@@ -221,6 +241,8 @@ pub(crate) fn fixture_spec(markets: &[(&str, &str, &str, Decimal, bool)]) -> Gro
                 clob_token_ids: vec![yes.to_owned(), no.to_owned()],
                 order_price_min_tick_size: tick,
                 closed,
+                active: None,
+                neg_risk_other: None,
             })
             .collect(),
     }
