@@ -159,14 +159,14 @@ impl<'a> Retirement<'a> {
         true
     }
 
-    pub(crate) fn complete(mut self) -> Result<Option<String>> {
+    pub(crate) fn complete(mut self) -> Result<Option<super::view::BookView>> {
         self.group.expire_snapshots();
         if self.deadline.is_some_and(|d| d <= self.frames.cutoff) && self.fault.is_none() {
             self.fault = Some(anyhow::anyhow!("crossed book reconciliation timed out"));
         }
         let ready = if matches!(self.end, End::Once) && self.fault.is_none() {
             if self.group.quotes_ready() {
-                Some(self.group.render())
+                Some(self.group.view())
             } else {
                 self.fault = Some(anyhow::anyhow!(
                     "{}",

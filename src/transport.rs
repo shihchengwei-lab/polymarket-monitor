@@ -2,12 +2,14 @@ use std::{
     future::poll_fn,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Poll, ready},
+    task::{Context as TaskContext, Poll, ready},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use futures_util::{Sink, SinkExt, StreamExt};
+#[cfg(test)]
+use futures_util::StreamExt;
+use futures_util::{Sink, SinkExt, Stream};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
@@ -160,25 +162,18 @@ impl Ingress {
         }))
     }
 
+    #[cfg(test)]
     async fn send_ping<S, E>(&self, socket: &mut S, pong_timeout: Duration) -> Result<()>
     where
         S: Sink<Message, Error = E> + Unpin,
         E: std::error::Error + Send + Sync + 'static,
     {
-        timeout(self.write_budget()?, async {
-            socket.feed(Message::Text("PING".into())).await?;
-            poll_fn(|cx| {
-                // While the sole writer is inside poll_flush, a different thread
-                // must be able to seal without waiting for the poll to return.
-                let first = self.arm_ping(pong_timeout)?;
-                let result = Pin::new(&mut *socket).poll_flush(cx);
-                if first && result.is_pending() {
-                    *self.lock().at(Instant::now())? = None;
-                }
-                result.map_err(anyhow::Error::from)
-            })
-            .await
-        })
+        let budget = self.write_budget()?;
+        let mut write = PendingWrite::new(WriteKind::QueuePing, budget);
+        timeout(
+            budget,
+            poll_fn(|cx| write.poll(cx, socket, self, pong_timeout)),
+        )
         .await?
     }
 
@@ -341,7 +336,7 @@ impl Transport {
 
     pub(crate) fn seal_with(
         mut self,
-        publication: Option<(&crate::output::Output, String)>,
+        publication: Option<(&crate::output::Output, crate::book::view::BookView)>,
     ) -> (SealedFrames, Result<()>) {
         let (at, termination) = {
             let mut state = self.ingress.lock();
@@ -355,7 +350,9 @@ impl Transport {
                 }
             };
             match publication {
-                Some((output, text)) => output.withdraw_ready(text, seal),
+                Some((output, book)) => {
+                    output.withdraw_ready(crate::output::Content::Book(Arc::new(book), false), seal)
+                }
                 None => seal(),
             }
         };
@@ -430,6 +427,141 @@ where
     })
 }
 
+enum WriteKind {
+    Protocol,
+    QueuePing,
+    FlushPing { acknowledged: bool },
+}
+
+struct PendingWrite {
+    kind: WriteKind,
+    due: Instant,
+}
+
+impl PendingWrite {
+    fn new(kind: WriteKind, budget: Duration) -> Self {
+        Self {
+            kind,
+            due: Instant::now() + budget,
+        }
+    }
+
+    fn poll<S, E>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        socket: &mut S,
+        ingress: &Ingress,
+        pong_timeout: Duration,
+    ) -> Poll<Result<()>>
+    where
+        S: Sink<Message, Error = E> + Unpin,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let mut socket = Pin::new(socket);
+        if matches!(self.kind, WriteKind::QueuePing) {
+            ready!(socket.as_mut().poll_ready(cx)).map_err(anyhow::Error::from)?;
+            socket
+                .as_mut()
+                .start_send(Message::Text("PING".into()))
+                .map_err(anyhow::Error::from)?;
+            self.kind = WriteKind::FlushPing {
+                acknowledged: false,
+            };
+        }
+        // A competing seal must see the provisional cutoff even inside a
+        // stalled flush poll. Remove it if this poll could not finish writing.
+        let armed = matches!(
+            self.kind,
+            WriteKind::FlushPing {
+                acknowledged: false
+            }
+        ) && ingress.arm_ping(pong_timeout)?;
+        let result = socket.poll_flush(cx);
+        if armed && result.is_pending() {
+            *ingress.lock().at(Instant::now())? = None;
+        }
+        result.map_err(anyhow::Error::from)
+    }
+}
+
+enum SocketEvent {
+    Flushed,
+    Incoming(Message),
+}
+
+async fn drive_market<S, E>(
+    socket: &mut S,
+    now: Instant,
+    timing: HeartbeatTiming,
+    frames: &mpsc::Sender<Frame>,
+    ingress: &Ingress,
+) -> Result<()>
+where
+    S: Sink<Message, Error = E> + Stream<Item = std::result::Result<Message, E>> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut interval = interval_at(now + timing.interval, timing.interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut pending: Option<PendingWrite> = None;
+    loop {
+        let pong_due = ingress.deadline()?;
+        let write_due = pending.as_ref().map(|write| write.due);
+        tokio::select! {
+            biased;
+            _ = wait_deadline(pong_due) => bail!("WebSocket PONG timed out"),
+            _ = wait_deadline(write_due) => {
+                ingress.deadline()?;
+                bail!("WebSocket heartbeat write timed out");
+            }
+            _ = interval.tick(), if pending.is_none() => {
+                pending = Some(PendingWrite::new(WriteKind::QueuePing, ingress.write_budget()?));
+            }
+            event = poll_fn(|cx| {
+                if let Some(write) = &mut pending {
+                    if let Poll::Ready(result) = write.poll(cx, socket, ingress, timing.timeout) {
+                        return Poll::Ready(result.map(|()| SocketEvent::Flushed));
+                    }
+                }
+                // tungstenite may also attempt an automatic Pong flush during
+                // read. Its WouldBlock path still polls the readable side.
+                Pin::new(&mut *socket).poll_next(cx).map(|item| {
+                    Ok(SocketEvent::Incoming(item.context("WebSocket stream ended")??))
+                })
+            }) => {
+                ingress.deadline()?;
+                match event? {
+                    SocketEvent::Flushed => pending = None,
+                    SocketEvent::Incoming(Message::Text(text)) if text.trim() == "PONG" => {
+                        ingress.pong()?;
+                        // A read can itself flush a queued ping along with an automatic Pong.
+                        if let Some(PendingWrite { kind: WriteKind::FlushPing { acknowledged }, .. }) = &mut pending {
+                            *acknowledged = true;
+                        }
+                    }
+                    SocketEvent::Incoming(Message::Text(text)) => {
+                        if !ingress.admit(frames, text) { return Ok(()); }
+                    }
+                    SocketEvent::Incoming(Message::Ping(_)) => {
+                        if pending.is_none() {
+                            pending = Some(PendingWrite::new(WriteKind::Protocol, ingress.write_budget()?));
+                        }
+                    }
+                    SocketEvent::Incoming(Message::Close(frame)) => bail!("WebSocket closed: {frame:?}"),
+                    SocketEvent::Incoming(Message::Binary(_)) => bail!("unexpected binary market message"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn receive_market(
     endpoint: String,
     subscription: Subscription,
@@ -441,6 +573,9 @@ async fn receive_market(
     let config = WebSocketConfig {
         max_message_size: Some(MESSAGE_BYTES),
         max_frame_size: Some(MESSAGE_BYTES),
+        // The subscription comes from a smaller, bounded Gamma response.
+        // Pending automatic control frames must not grow without bound.
+        max_write_buffer_size: MESSAGE_BYTES,
         ..Default::default()
     };
     let (mut socket, _) = timeout(
@@ -459,39 +594,7 @@ async fn receive_market(
     {
         return Ok(());
     }
-    let mut interval = interval_at(now + timing.interval, timing.interval);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        let deadline = ingress.deadline()?;
-        tokio::select! {
-            _ = async {
-                match deadline {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => bail!("WebSocket PONG timed out"),
-            _ = interval.tick() => {
-                ingress.send_ping(&mut socket, timing.timeout).await?;
-            }
-            incoming = socket.next() => {
-                ingress.deadline()?;
-                match incoming.context("WebSocket stream ended")?? {
-                    Message::Text(text) if text.trim() == "PONG" => ingress.pong()?,
-                    Message::Text(text) => if !ingress.admit(frames, text) {
-                        return Ok(());
-                    },
-                    Message::Ping(_) => {
-                        let result = timeout(ingress.write_budget()?, socket.flush()).await;
-                        ingress.deadline()?;
-                        result??;
-                    }
-                    Message::Close(frame) => bail!("WebSocket closed: {frame:?}"),
-                    Message::Binary(_) => bail!("unexpected binary market message"),
-                    _ => {}
-                }
-            }
-        }
-    }
+    drive_market(&mut socket, now, timing, frames, ingress).await
 }
 
 #[cfg(test)]
@@ -499,6 +602,117 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    struct WriteGate {
+        io: tokio::io::DuplexStream,
+        open: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl tokio::io::AsyncRead for WriteGate {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for WriteGate {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            ready!(std::future::Future::poll(self.open.as_mut(), cx));
+            Pin::new(&mut self.io).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            ready!(std::future::Future::poll(self.open.as_mut(), cx));
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn market_reads_before_cutoff_with_application_ping_or_protocol_pong_pending() {
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+        for protocol in [false, true] {
+            let started = Instant::now();
+            let at = |ms| started + Duration::from_millis(ms);
+            let (client, server) = tokio::io::duplex(4096);
+            let mut client = WebSocketStream::from_raw_socket(
+                WriteGate {
+                    io: client,
+                    open: Box::pin(sleep_until(at(130))),
+                },
+                Role::Client,
+                None,
+            )
+            .await;
+            let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            let (mut transport, tx) = Transport::local();
+            let ingress = transport.ingress.clone();
+            let worker = tokio::spawn(async move {
+                let timing = HeartbeatTiming {
+                    interval: Duration::from_millis(if protocol { 1000 } else { 85 }),
+                    timeout: Duration::from_secs(20),
+                };
+                let result = drive_market(&mut client, started, timing, &tx, &ingress).await;
+                ingress.finish(result);
+            });
+            tokio::time::advance(Duration::from_millis(85)).await;
+            if protocol {
+                server.send(Message::Ping(vec![1])).await.unwrap();
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(14)).await;
+            server
+                .send(Message::Text("trade-before-cut".into()))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            let first = transport
+                .frames
+                .try_recv()
+                .expect("readable trade must be admitted before the write resumes");
+            assert_eq!(first.received_at, at(99));
+            assert!(matches!(first.payload, Payload::Raw(ref text) if text == "trade-before-cut"));
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            server
+                .send(Message::Text("trade-at-cut".into()))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            let second = transport.frames.try_recv().unwrap();
+            assert_eq!(second.received_at, at(100));
+            assert!(matches!(second.payload, Payload::Raw(ref text) if text == "trade-at-cut"));
+
+            tokio::time::advance(Duration::from_millis(30)).await;
+            let reply = server.next().await.unwrap().unwrap();
+            assert_eq!(
+                reply,
+                if protocol {
+                    Message::Pong(vec![1])
+                } else {
+                    Message::Text("PING".into())
+                }
+            );
+            worker.abort();
+        }
+    }
 
     fn subscription() -> Subscription {
         Subscription::for_test(Instant::now() + Duration::from_secs(10))

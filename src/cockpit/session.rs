@@ -1,4 +1,4 @@
-use super::{Screen, Sink, desk};
+use super::{DiagnosticSink, Screen, desk};
 use crate::{
     gamma_discovery::{self, Discovery},
     monitor,
@@ -72,11 +72,11 @@ fn start(client: &Client, id: u64, slug: Option<String>) -> Result<(Route, Optio
                 quantity,
                 move |at, input| desk.receive(at, input),
             );
-            let sink = |diagnostic| Sink {
-                channel: tx.clone(),
-                diagnostic,
-            };
-            let output = Output::new(sink(false), sink(true));
+            let feed = tx.clone();
+            let output = Output::with_book_sink(
+                move |book| feed.send_modify(|screen| screen.publish_book(book)),
+                DiagnosticSink(tx.clone()),
+            );
             let endpoints = monitor::Endpoints::default();
             let monitoring =
                 monitor::watch_group_until(&client, &endpoints, group, &output, stopped);

@@ -14,6 +14,14 @@ struct BookFixture {
     observed: fixture_queue::Receiver<Arc<CommittedBook>>,
 }
 async fn approve(group: &mut NegRiskEventGroup, members: [(&str, &str, &str); 2]) {
+    approve_named(
+        group,
+        members.map(|(condition, yes, no)| (condition, yes, no, condition)),
+    )
+    .await;
+}
+
+async fn approve_named(group: &mut NegRiskEventGroup, members: [(&str, &str, &str, &str); 2]) {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -25,9 +33,9 @@ async fn approve(group: &mut NegRiskEventGroup, members: [(&str, &str, &str); 2]
         let (mut socket, _) = server.accept().await.unwrap();
         let mut request = [0; 2048];
         assert!(socket.read(&mut request).await.unwrap() > 0);
-        let markets = members.map(|(c, y, n)| {
+        let markets = members.map(|(c, y, n, name)| {
             json!({
-                "question":c, "conditionId":c, "outcomes":["Yes","No"],
+                "question":name, "conditionId":c, "outcomes":["Yes","No"],
                 "clobTokenIds":[y,n],"orderPriceMinTickSize":"0.0001","closed":false
             })
         });
@@ -128,6 +136,7 @@ impl Replay {
     }
     fn idle(hedge_delay: u64) -> Self {
         let legs = ["1", "2"].map(|id| Leg {
+            condition: if id == "1" { "a" } else { "b" }.into(),
             name: id.into(),
             asset: AssetId::new(id).unwrap(),
             no: AssetId::new(&format!("9{id}")).unwrap(),
@@ -273,6 +282,35 @@ fn fee_at(r: &mut Replay, micros: u64, result: Result<Vec<Leg>, String>) {
         .unwrap();
 }
 #[test]
+fn rename_keeps_in_flight_hedges_and_updates_labels_but_fee_changes_stop_them() {
+    for fee_changed in [false, true] {
+        let mut r = Replay::new(false);
+        r.sell(21, "27");
+        r.clock(41);
+        let mut rules = r.driver.desk.as_ref().unwrap().legs.clone();
+        rules[1].name = "New name".into();
+        if fee_changed {
+            rules[1].rate = D::new(1, 1);
+            rules[1].fee = FeeModel::new(rules[1].rate, false).unwrap();
+        }
+        fee_at(&mut r, 50_000, Ok(rules));
+        r.clock(62);
+        let snapshot = r.screen();
+        assert_eq!(snapshot["slots"][0]["shares"], "25");
+        assert_eq!(
+            snapshot["slots"][1]["shares"],
+            if fee_changed { "0" } else { "25" }
+        );
+        assert_eq!(snapshot["auto"], !fee_changed);
+        assert_eq!(snapshot["frozen"], "0");
+        assert_eq!(snapshot["conserved"], true);
+        if !fee_changed {
+            assert_eq!(snapshot["slots"][1]["name"], "New name");
+        }
+    }
+}
+
+#[test]
 fn published_rates_follow_verification_even_between_normal_screen_ticks() {
     let mut r = Replay::new(false);
     let snapshots = r.driver.tx.subscribe();
@@ -289,7 +327,10 @@ fn published_rates_follow_verification_even_between_normal_screen_ticks() {
         );
         r.input(micros / 1000 + 1, MarketInput::Frontier);
         let frame = snapshots.borrow();
-        assert_eq!(frame.desk["rates"]["1"].as_str(), valid.then_some("0"));
+        assert_eq!(
+            frame.desk["rates"][crate::book::view::market_identity("a", "1", "91")].as_str(),
+            valid.then_some("0")
+        );
         assert_eq!(frame.desk["error"].is_null(), valid);
     }
 }
@@ -683,7 +724,10 @@ async fn both_http_fee_sources_require_success_before_authorizing_hedges() {
         r.clock(160);
         let v = r.screen();
         assert_eq!(v["slots"][1]["shares"], if valid { "5" } else { "0" });
-        assert_eq!(v["rates"]["1"].as_str(), valid.then_some("0"));
+        assert_eq!(
+            v["rates"][crate::book::view::market_identity("a", "1", "91")].as_str(),
+            valid.then_some("0")
+        );
         assert_eq!(v["error"].is_null(), valid);
     }
 }
@@ -938,6 +982,7 @@ async fn run_market_wire(timeout_gap: Option<bool>) {
     let (cmd, inbox) = mpsc::channel(8);
     let (fees, metadata) = mpsc::channel(1);
     let legs = ["1", "2"].map(|id| Leg {
+        condition: if id == "1" { "a" } else { "b" }.into(),
         name: id.into(),
         asset: AssetId::new(id).unwrap(),
         no: AssetId::new(&format!("9{id}")).unwrap(),
@@ -1511,6 +1556,64 @@ impl DeadlineMarket {
         self.sell();
         self.at(cancel_us + 40_000).await;
         self.idle();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_associates_quotes_and_fees_by_identity_across_renames() {
+    let mut m = DeadlineMarket::new(0, 0, 0).await;
+    let selector = |name| [("a", "1", "91", "Same"), ("b", "2", "92", name)];
+    let mut rules = m
+        .replay
+        .lock()
+        .unwrap()
+        .driver
+        .desk
+        .as_ref()
+        .unwrap()
+        .legs
+        .clone();
+    rules[1].rate = D::new(1, 1);
+    rules[1].fee = FeeModel::new(rules[1].rate, false).unwrap();
+    // Seed the fee display from an independently verified paper roster.
+    let desk = Desk::new(rules, m.origin).unwrap().screen();
+    let (channel, screen) = watch::channel(Screen::default());
+    channel.send_modify(|s| s.desk = Arc::new(desk));
+    let mut ids = None;
+    for name in ["  Second", "Same"] {
+        approve_named(&mut m.group, selector(name)).await;
+        channel.send_modify(|s| s.publish_book(Arc::new(m.group.view())));
+        let request = hyper::Request::get("/snapshot")
+            .body(hyper::Body::empty())
+            .unwrap();
+        let raw = hyper::body::to_bytes(super::super::response(request, &screen).into_body())
+            .await
+            .unwrap();
+        let view: Value = serde_json::from_slice(&raw).unwrap();
+        let book = &view["book"];
+        assert_eq!(book["status"], "Ready");
+        let a = &book["markets"][0];
+        let b = &book["markets"][1];
+        assert_eq!(a["name"], "Same");
+        assert_eq!(b["name"], name);
+        assert_eq!(
+            a["yes"]["bid"][0].as_str().unwrap().parse::<D>().unwrap(),
+            D::new(40, 2)
+        );
+        assert_eq!(
+            b["yes"]["bid"][0].as_str().unwrap().parse::<D>().unwrap(),
+            D::new(57, 2)
+        );
+        let keys = [a["id"].as_u64().unwrap(), b["id"].as_u64().unwrap()];
+        assert_ne!(keys[0], keys[1]);
+        if let Some(ids) = ids {
+            assert_eq!(keys, ids);
+        }
+        ids = Some(keys);
+        assert_eq!(view["desk"]["rates"][keys[0].to_string()], "0");
+        assert_eq!(view["desk"]["rates"][keys[1].to_string()], "0.1");
+        assert!(a.get("identity").is_none() && b.get("identity").is_none());
+        assert!(view["desk"]["slots"][0].get("identity").is_none());
     }
 }
 

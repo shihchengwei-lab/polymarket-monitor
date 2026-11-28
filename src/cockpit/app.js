@@ -7,6 +7,7 @@ let mode = "live", connected = false, last = null, history = [], historyBytes = 
 let frozen = [], paper = null, animation = 0, anchor = 0, readId = 0;
 let fileError = "";
 let pinned=null, sessionId=null, switching=false;
+let lastBookStates=new Map();
 
 function row(parent, cells, tag = "td") {
   const tr = parent.insertRow();
@@ -44,61 +45,59 @@ function decimal(v) {
   return (v<0n?"-":"")+(n/scale).toString()+(fraction?"."+fraction:"");
 }
 function market(screen) {
-  const lines = screen.book.split("\n");
-  const head = /^(.*) \| (Ready|QuotesReady|NotReady) \((\d+\/\d+) 子市場\)$/.exec(lines[0]);
-  const summary = lines.findIndex(s => s.startsWith("YES 中間價總和 "));
-  const rows=[], states=new Map();
-  let name="", askSum=0n, bidSum=0n, feeSum=0n, depthOk=true, bidsOk=true, feesOk=true, complete=!!head && head[2]==="Ready", yesCount=0;
-  for (const line of lines.slice(summary+1)) {
-    if (!line.startsWith("  ")) { name=line; continue; }
-    const m = /^  (YES|NO) (Disconnected|Stale|Reconciling|Syncing|Synced)(?: \[.*?\])?(?: \| bid (.*?) \/ ask (.*?) \| tick (\S+))?$/.exec(line);
-    if (!m) continue;
-    rows.push([name,m[1],m[2],m[3],m[4],m[5]]);
-    states.set(name+" · "+m[1], m[2]);
-    if (m[1]==="YES") {
-      yesCount++;
-      const ask = m[4]?.split(" × ")[0];
-      const bid=m[3]?.split(" × ")[0];
-      if(bid && bid!==none) bidSum+=units(bid); else bidsOk=false;
-      if (ask && ask!==none){
-        const price=units(ask);askSum+=price;
-        if(units(m[4].split(" × ")[1])<scale)depthOk=false;
-        const rate=screen.desk?.rates?.[name];
-        if(typeof rate==="string"){
-          // Per one-share fill, nearest 0.00001 pUSD, half up.
-          const denominator=scale*scale*(scale/100000n);
-          feeSum+=(units(rate)*price*(scale-price)+denominator/2n)/denominator*(scale/100000n);
-        }else feesOk=false;
-      }else complete=false;
+  const book=screen.book;
+  const markets=book?.markets??[], rows=[], states=new Map();
+  let askSum=0n, bidSum=0n, feeSum=0n, depthOk=true, asksOk=true, bidsOk=true, feesOk=true;
+  const quote=level=>level?level.join(" × "):none;
+  for(const item of markets){
+    const label=item.name+(item.closed?" [已關閉]":"");
+    for(const [outcome,token] of [["YES",item.yes],["NO",item.no]]){
+      const state=token.state.split(" ")[0];
+      rows.push([label,outcome,state,quote(token.bid),quote(token.ask),token.tick,item.id]);
+      states.set(JSON.stringify([item.id,outcome]), {label:label+" · "+outcome,state});
     }
+    if(item.yes.bid)bidSum+=units(item.yes.bid[0]); else bidsOk=false;
+    if(item.yes.ask){
+      const price=units(item.yes.ask[0]);
+      askSum+=price;
+      if(units(item.yes.ask[1])<scale)depthOk=false;
+      const rate=screen.desk?.rates?.[item.id];
+      if(typeof rate==="string"){
+        // Per one-share fill, nearest 0.00001 pUSD, half up.
+        const denominator=scale*scale*(scale/100000n);
+        feeSum+=(units(rate)*price*(scale-price)+denominator/2n)/denominator*(scale/100000n);
+      }else feesOk=false;
+    }else asksOk=false;
   }
-  complete &&= yesCount>0 && yesCount===Number(head[3].split("/")[1]) && !screen.stopped;
-  return {title:head?.[1],status:head?.[2], synced:head?.[3], rows,states,
-    cost:complete&&feesOk&&depthOk?askSum+feeSum:null,
-    edge:complete?decimal(scale-askSum):none,
-    net:complete&&feesOk?decimal(scale-askSum-feeSum):none,
-    maker:head?.[2]==="Ready" && !screen.stopped && bidsOk && yesCount>0 && yesCount===Number(head[3].split("/")[1])?decimal(scale-bidSum):none,
-    note:lines.slice(1,Math.max(1,summary)).join(" · ")};
+  const ready=book?.status==="Ready" && markets.length>0 && markets.length===book.total && !screen.stopped;
+  return {title:book?.title,status:book?.status,rows,states,
+    cost:ready&&asksOk&&feesOk&&depthOk?askSum+feeSum:null,
+    edge:ready&&asksOk?decimal(scale-askSum):none,
+    net:ready&&asksOk&&feesOk?decimal(scale-askSum-feeSum):none,
+    maker:ready&&bidsOk?decimal(scale-bidSum):none,
+    note:book?.notes.join(" · ")};
 }
 function queueView(m, isCurrent) {
   const select=el("track");
   const quotes=m.rows.filter(r=>r[2]==="Synced" && r[3]?.includes(" × "));
   const selected=pinned?.key??"";
   const options=[new Option("選擇子市場與 Token","")];
-  for(const [name,token] of quotes){
-    const key=JSON.stringify([name,token]);
+  const keyFor=row=>JSON.stringify([row[6],row[1]]);
+  for(const row of quotes){
+    const [name,token]=row;
+    const key=keyFor(row);
     options.push(new Option(name+" · "+token,key));
   }
   if(selected && !options.some(o=>o.value===selected))
-    options.push(new Option(JSON.parse(selected).join(" · "),selected));
+    options.push(new Option(pinned.label,selected));
   select.replaceChildren(...options);select.value=selected;
   select.onchange=()=>{
-    const quote=quotes.find(r=>JSON.stringify(r.slice(0,2))===select.value);
-    pinned=quote?{key:select.value,level:quote[3].split(" × ")}:null;
+    const quote=quotes.find(r=>keyFor(r)===select.value);
+    pinned=quote?{key:select.value,label:quote[0]+" · "+quote[1],level:quote[3].split(" × ")}:null;
     show();
   };
   if(!pinned){put("queueInfo","選取一腿，追蹤同一最佳買價的可見股數變化。");return;}
-  const quote=quotes.find(r=>JSON.stringify(r.slice(0,2))===pinned.key);
+  const quote=quotes.find(r=>keyFor(r)===pinned.key);
   const level=quote?.[3].split(" × ");
   const [price,initial]=pinned.level;
   const details=isCurrent && level && units(level[0])===units(price)
@@ -107,7 +106,7 @@ function queueView(m, isCurrent) {
   put("queueInfo","買價 "+price+" · 起始 "+initial+" 股 · "+details);
 }
 function showBook(frame, frames, index) {
-  const screen=frame?.screen ?? {book:""};
+  const screen=frame?.screen ?? {};
   const m=market(screen);
   put("title",m.title || screen.slug || "行情觀測站");
   put("heading","最佳買賣盤");
@@ -115,7 +114,7 @@ function showBook(frame, frames, index) {
   const active=mode==="history" || connected;
   el("queue").hidden=false;queueView(m,active && !screen.stopped);
   metrics(["Taker 毛價差 · 最佳賣價","Taker 淨價差 · 每腿 1 股扣費後","Maker 空間 · 1 − 最佳買價總和"],active?[m.edge,m.net,m.maker]:[none,none,none]);
-  table(["子市場","Token","狀態","最佳買價 × 股數","最佳賣價 × 股數","跳動單位"],m.rows,"使用 cockpit 加上事件 slug 接收即時行情，或載入紙上回放。");
+  table(["子市場","Token","狀態","最佳買價 × 股數","最佳賣價 × 股數","跳動單位"],m.rows.map(row=>row.slice(0,6)),"使用 cockpit 加上事件 slug 接收即時行情，或載入紙上回放。");
   put("notice",fileError || [!active?"目前顯示最後收到的畫面":"",m.note,screen.diagnostic].filter(Boolean).join(" · "));
   logs(frames.slice(0,index+1).slice(-120).flatMap(x=>x.transitions).slice(-12).reverse());
 }
@@ -244,7 +243,7 @@ function receiveSession(screen){
   if(sessionId===screen.session)return;
   if(sessionId!==null){
     stop();mode="live";last=null;history=[];historyBytes=0;frozen=[];pinned=null;
-    basketVisuals.reset();fileError="";put("answer","");
+    basketVisuals.reset();lastBookStates.clear();fileError="";put("answer","");
   }
   latestDesk=null;
   sessionId=screen.session;
@@ -260,14 +259,21 @@ async function poll(){
     const cancellations=(screen.desk?.cancellations??[]).filter(c=>c.order_id>lastCancel).map(c=>"#"+c.order_id+" · "+c.label);
     latestDesk=screen.desk;
     basketVisuals.sample(market(screen).cost);
-    if(cancellations.length || ratesChanged || !last || screen.sequence!==last.screen.sequence || screen.book!==last.screen.book){
+    if(cancellations.length || ratesChanged || !last || screen.sequence!==last.screen.sequence){
       // History only needs the fee schedule, not a copy of the account log.
       screen.desk={rates:screen.desk?.rates};
-      const m=market(screen), prior=last?.states??new Map(), transitions=[];
-      for(const [key,state] of m.states)if(prior.get(key)!==state)transitions.push(key+" · "+(prior.get(key)?prior.get(key)+" → ":"")+state);
-      const ms=Math.floor(performance.now());last={ms,screen,states:m.states,transitions:transitions.concat(cancellations).slice(-32)};
-      history.push(last);historyBytes+=screen.book.length;
-      while(history.length>1 && (history.length>120 || historyBytes>2_000_000)) historyBytes-=history.shift().screen.book.length;
+      const m=market(screen), transitions=[];
+      for(const [key,{label,state}] of m.states){
+        const previous=lastBookStates.get(key)?.state;
+        if(previous!==state)transitions.push(label+" · "+(previous?previous+" → ":"")+state);
+      }
+      const visibleTransitions=transitions.concat(cancellations).slice(-32);
+      const bytes=JSON.stringify(screen).length+JSON.stringify(visibleTransitions).length;
+      const ms=Math.floor(performance.now());
+      lastBookStates=m.states;
+      last={ms,screen,transitions:visibleTransitions,bytes};
+      history.push(last);historyBytes+=bytes;
+      while(history.length && (history.length>120 || historyBytes>2_000_000))historyBytes-=history.shift().bytes;
     }
   }catch{connected=false;basketVisuals.sample(null);}
   if(mode==="live")show();

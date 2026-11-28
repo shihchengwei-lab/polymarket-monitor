@@ -12,6 +12,7 @@ pub use self::live_paper::PaperDesk;
 pub(crate) mod frame;
 pub(crate) mod input;
 mod live_paper;
+pub(crate) mod view;
 use crate::paper::{Error as PaperError, chaos_exchange::ChaosExchange};
 
 use crate::gamma_discovery::{self, Discovery, GroupSpec};
@@ -1682,119 +1683,8 @@ impl NegRiskEventGroup {
             .sum()
     }
 
-    pub(crate) fn retiring_view(&self) -> String {
-        format!(
-            "{} | NotReady (0/{} 子市場)\n",
-            crate::output::single_line(&self.title),
-            self.markets().len()
-        )
-    }
-
     pub fn render(&self) -> String {
-        use crate::output::single_line;
-        use std::fmt::Write;
-
-        let markets = self.markets();
-        let synced = markets
-            .iter()
-            .filter(|market| self.market_synced(market))
-            .count();
-        let quotes_ready =
-            matches!(self.membership, Membership::Open { .. }) && synced == markets.len();
-        let quotes_only = self.quotes_only();
-        let ready = quotes_ready && !quotes_only;
-        let status = match (quotes_ready, quotes_only) {
-            (true, false) => "Ready",
-            (true, true) => "QuotesReady",
-            (false, _) => "NotReady",
-        };
-        let mut output = format!(
-            "{} | {status} ({synced}/{} 子市場)\n",
-            single_line(&self.title),
-            markets.len()
-        );
-        match &self.membership {
-            Membership::Unavailable { reason, .. } => {
-                let _ = writeln!(output, "Gamma 成員不可用：{}", single_line(reason));
-            }
-            Membership::Closed(..) => {
-                let _ = writeln!(output, "事件已結束");
-            }
-            Membership::SettlementCapacity(_) => {
-                let _ = writeln!(output, "{SettlementCapacity}");
-            }
-            Membership::Pending => {
-                let _ = writeln!(output, "尚未取得 Gamma 成員資料");
-            }
-            Membership::Open { .. } => {}
-        }
-        if self.gamma_failed {
-            let status = if self.awaiting_gamma() {
-                "等待重新查詢"
-            } else {
-                "使用上次確認的資料"
-            };
-            let _ = writeln!(output, "Gamma 更新失敗，{status}");
-        }
-        if quotes_only {
-            let _ = writeln!(
-                output,
-                "此事件只顯示已啟用的具名選項；整籃計算與紙上交易已停用"
-            );
-        }
-        let sum = self.yes_sum(ready).map_or_else(
-            || "—".to_owned(),
-            |sum| {
-                let difference = &sum - PROBABILITY_ONE;
-                format!(
-                    "{} (與 1 的差 {})",
-                    format_probability(sum),
-                    format_probability(difference)
-                )
-            },
-        );
-        let _ = writeln!(output, "YES 中間價總和 {sum}");
-        for market in markets {
-            let _ = writeln!(
-                output,
-                "{}{}",
-                single_line(&market.name),
-                if self.event_closed() || self.market_closed(market) {
-                    " [已關閉]"
-                } else {
-                    ""
-                }
-            );
-            for (outcome, book) in ["YES", "NO"].into_iter().zip(market.books()) {
-                let _ = write!(output, "  {outcome} {}", book.label());
-                if let Some(synced) = book.synced() {
-                    let _ = write!(
-                        output,
-                        " | {} | tick {}",
-                        synced.levels.quotes(),
-                        synced.tick
-                    );
-                }
-                let _ = writeln!(output);
-            }
-            if quotes_ready {
-                let gap = Self::midpoint(&market.yes)
-                    .zip(Self::midpoint(&market.no))
-                    .map_or_else(
-                        || "—".to_owned(),
-                        |(yes, no)| {
-                            let difference = yes + no - PROBABILITY_ONE;
-                            if difference.sign() == Sign::NoSign {
-                                "符合".to_owned()
-                            } else {
-                                format!("偏差 {}", format_probability(difference))
-                            }
-                        },
-                    );
-                let _ = writeln!(output, "  YES + NO 補數檢核 {gap}");
-            }
-        }
-        output
+        self.view().to_string()
     }
 }
 

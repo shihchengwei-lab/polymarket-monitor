@@ -1,12 +1,14 @@
 mod desk;
 mod session;
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     io::{self, Write},
     sync::Arc,
     time::Duration,
 };
 
+use crate::book::view::BookView;
 #[cfg(test)]
 use crate::output::Output;
 use anyhow::{Context, Result};
@@ -23,33 +25,95 @@ struct Screen {
     session: u64,
     slug: Arc<str>,
     sequence: u64,
-    book: Arc<str>,
+    book: Option<Arc<BookView>>,
+    market_ids: Arc<BTreeMap<String, u64>>,
+    next_market_id: u64,
     diagnostic: Arc<str>,
     stopped: bool,
     desk: Arc<serde_json::Value>,
 }
 
-// Output already coalesces pending frames on its dedicated writer thread.
-// Only owned snapshots leave that thread. A socket never holds a channel borrow.
-struct Sink {
-    channel: watch::Sender<Screen>,
-    diagnostic: bool,
+impl Screen {
+    fn publish_book(&mut self, book: Arc<BookView>) {
+        if !book.markets.is_empty()
+            && (self.market_ids.len() != book.markets.len()
+                || book
+                    .markets
+                    .iter()
+                    .any(|market| !self.market_ids.contains_key(&market.identity)))
+        {
+            let mut next = BTreeMap::new();
+            for market in &book.markets {
+                let id = self
+                    .market_ids
+                    .get(&market.identity)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.next_market_id += 1;
+                        self.next_market_id
+                    });
+                next.insert(market.identity.clone(), id);
+            }
+            self.market_ids = Arc::new(next);
+        }
+        self.book = Some(book);
+        self.sequence += 1;
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let book = self.book.as_ref().map(|book| {
+            let mut data = json!(&**book);
+            for (market, view) in data["markets"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .zip(&book.markets)
+            {
+                market["id"] = json!(self.market_ids[&view.identity]);
+            }
+            data
+        });
+        let mut desk = (*self.desk).clone();
+        if let Some(rates) = desk
+            .get_mut("rates")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            *rates = std::mem::take(rates)
+                .into_iter()
+                .filter_map(|(identity, rate)| {
+                    Some((self.market_ids.get(&identity)?.to_string(), rate))
+                })
+                .collect();
+        }
+        if let Some(slots) = desk
+            .get_mut("slots")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for slot in slots {
+                let slot = slot.as_object_mut().unwrap();
+                if let Some(id) = slot
+                    .remove("identity")
+                    .and_then(|identity| self.market_ids.get(identity.as_str()?).copied())
+                {
+                    slot.insert("id".into(), json!(id));
+                }
+            }
+        }
+        json!({"session":self.session,"slug":&*self.slug,"sequence":self.sequence,
+            "book":book,"diagnostic":&*self.diagnostic,"stopped":self.stopped,"desk":desk})
+    }
 }
 
-impl Write for Sink {
+struct DiagnosticSink(watch::Sender<Screen>);
+impl Write for DiagnosticSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let text: Arc<str> = String::from_utf8_lossy(bytes).trim_end().into();
-        self.channel.send_modify(|screen| {
+        self.0.send_modify(|screen| {
+            screen.diagnostic = text;
             screen.sequence += 1;
-            if self.diagnostic {
-                screen.diagnostic = text;
-            } else {
-                screen.book = text;
-            }
         });
         Ok(bytes.len())
     }
-
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -79,12 +143,10 @@ fn response(req: Request<Body>, state: &watch::Receiver<Screen>) -> Response<Bod
         ),
         (&Method::GET, "/snapshot") => {
             let screen = state.borrow().clone();
-            let data = json!({"session":screen.session,"slug":&*screen.slug,"sequence":screen.sequence,"book":&*screen.book,
-                "diagnostic":&*screen.diagnostic,"stopped":screen.stopped,"desk":&*screen.desk});
             (
                 StatusCode::OK,
                 "application/json",
-                Body::from(data.to_string()),
+                Body::from(screen.snapshot().to_string()),
             )
         }
         _ => (StatusCode::NOT_FOUND, "text/plain", Body::empty()),
@@ -243,14 +305,12 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (channel, rx) = watch::channel(Screen::default());
-        let output = Output::new(
-            Sink {
-                channel,
-                diagnostic: false,
-            },
+        let output = Output::with_book_sink(
+            move |book| channel.send_modify(|screen| screen.publish_book(book)),
             io::sink(),
         );
-        output.finish("x".repeat(4096)).await.unwrap();
+        let view = |title: &str| crate::book::NegRiskEventGroup::new(title).view();
+        output.finish_book(view(&"x".repeat(4096))).await.unwrap();
 
         // A 64-byte socket cannot buffer the outstanding HTTP response.
         let (server, mut client) = tokio::io::duplex(64);
@@ -273,13 +333,13 @@ mod tests {
             .unwrap();
         client.read_u8().await.unwrap();
         for n in 0..1000 {
-            output.view(n.to_string());
+            output.view_book(Arc::new(view(&n.to_string())));
         }
-        timeout(Duration::from_secs(2), output.finish("latest".into()))
+        timeout(Duration::from_secs(2), output.finish_book(view("latest")))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&*rx.borrow().book, "latest");
+        assert_eq!(rx.borrow().book.as_ref().unwrap().title, "latest");
         assert!(!connection.is_finished());
         drop(client);
         let _ = connection.await.unwrap();

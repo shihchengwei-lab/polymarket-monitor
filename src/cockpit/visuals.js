@@ -90,16 +90,19 @@ const basketVisuals = (() => {
     const status=!connected?"最後收到的持倉":!holdings.length?"等待帳本":!held?"尚無持倉":aligned?"已成套鎖定":desk.busy?"補腿對齊中":"未成套 · 有剩餘曝險";
     put("alignState",status);
     el("slots").dataset.state=connected && held?(aligned?"aligned":"partial"):"idle";
-    const names=new Set(holdings.map(s=>s.name));
-    for(const [name,tile] of tiles)if(!names.has(name)){tile.root.remove();tiles.delete(name);}
+    const keyFor=(slot,index)=>slot.id??"desk:"+index;
+    const keys=new Set(holdings.map(keyFor));
+    for(const [key,tile] of tiles)if(!keys.has(key)){tile.root.remove();tiles.delete(key);}
     holdings.forEach((s,i)=>{
-      let tile=tiles.get(s.name);
+      const key=keyFor(s,i);
+      let tile=tiles.get(key);
       if(!tile){
         const root=document.createElement("article"),name=document.createElement("div"),shares=document.createElement("strong"),prints=document.createElement("div");
-        name.className="slotName";name.textContent=name.title=s.name;prints.className="prints";
+        name.className="slotName";prints.className="prints";
         root.append(name,shares,prints);el("slots").append(root);
-        tile={root,shares,prints};tiles.set(s.name,tile);
+        tile={root,name,shares,prints};tiles.set(key,tile);
       }
+      tile.name.textContent=tile.name.title=s.name;
       tile.shares.textContent=s.shares+" 股";
       const recent=(desk.tape??[]).filter(e=>connected && e.leg===i && now-e.at<5000 && e.at<=now).slice(-3);
       const ids=new Set(recent.map(e=>String(e.id)));

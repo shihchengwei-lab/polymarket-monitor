@@ -3,7 +3,6 @@ use crate::wire::{PublicTrade, Side as TradeSide};
 use crate::{
     book::{BasketUpdate, CommittedBook, MarketInput},
     gamma_discovery::{self, Discovery},
-    output::single_line,
     paper::{
         AccountId, AssetId, Cash, ClientOrderId, OrderKey, Price, Quantity, Shares, Side,
         chaos_exchange::ChaosExchange,
@@ -42,6 +41,7 @@ fn wall() -> u64 {
 
 #[derive(Clone, PartialEq)]
 pub(super) struct Leg {
+    condition: String,
     name: String,
     asset: AssetId,
     no: AssetId,
@@ -50,6 +50,21 @@ pub(super) struct Leg {
     minimum: D,
     delay: u64,
 }
+impl Leg {
+    fn same_rules(&self, other: &Self) -> bool {
+        self.condition == other.condition
+            && self.asset == other.asset
+            && self.no == other.no
+            && self.fee == other.fee
+            && self.minimum == other.minimum
+            && self.delay == other.delay
+    }
+
+    fn identity(&self) -> String {
+        crate::book::view::market_identity(&self.condition, self.asset.as_str(), self.no.as_str())
+    }
+}
+
 async fn roster(client: &Client, slug: &str, gamma: &str, clob: &str) -> Result<Vec<Leg>> {
     let Discovery::Open(group) =
         gamma_discovery::discover(client, gamma, slug, Duration::from_secs(60)).await?
@@ -99,9 +114,8 @@ async fn roster(client: &Client, slug: &str, gamma: &str, clob: &str) -> Result<
             rate == D::ZERO || (info["fd"]["e"] == 1 && info["fd"]["to"] == true),
             "未知費率模型"
         );
-        let name = single_line(&name).to_string();
-        ensure!(!legs.iter().any(|l: &Leg| l.name == name), "子市場名稱重複");
         legs.push(Leg {
+            condition,
             name,
             asset: AssetId::new(&ids[0])?,
             no: AssetId::new(&ids[1])?,
@@ -289,7 +303,19 @@ impl Desk {
 
     fn verify_rules(&mut self, result: &Result<Vec<Leg>, String>, at: u64) {
         self.fee_block = match result {
-            Ok(legs) if *legs == self.legs => None,
+            Ok(legs)
+                if legs.len() == self.legs.len()
+                    && self
+                        .legs
+                        .iter()
+                        .zip(legs)
+                        .all(|(current, fresh)| current.same_rules(fresh)) =>
+            {
+                for (current, fresh) in self.legs.iter_mut().zip(legs) {
+                    current.name.clone_from(&fresh.name);
+                }
+                None
+            }
             Ok(_) => Some("場次規則已變更"),
             Err(_) => Some("費率核對失敗"),
         };
@@ -754,7 +780,7 @@ impl Desk {
                 cancellations.push(entry);
             }
         }
-        json!({"orders":orders,"cancellations":cancellations,"queue":queue,"slots":positions.iter().map(|(name,n)|json!({"name":name,"shares":n.to_string()})).collect::<Vec<_>>(),"markers":self.markers,"tape":self.tape,"state":state,"busy":self.round.is_some(),"ready":self.quotes.is_some(),"lag":self.lag,"auto":self.auto,"cash":cash.to_string(),"frozen":frozen.to_string(),"pnl":marked.map(|v|v.to_string()),"conserved":self.ex.is_conserved(),"log":self.log,"positions":positions.iter().filter(|(_,n)|*n>D::ZERO).map(|(s,n)|format!("{s} × {n}")).collect::<Vec<_>>(),"error":self.fee_block,"rates":self.fee_block.is_none().then(||self.legs.iter().map(|l|(l.name.clone(),Value::String(l.rate.to_string()))).collect::<serde_json::Map<_,_>>())})
+        json!({"orders":orders,"cancellations":cancellations,"queue":queue,"slots":positions.iter().zip(&self.legs).map(|((name,n),leg)|json!({"identity":leg.identity(),"name":name,"shares":n.to_string()})).collect::<Vec<_>>(),"markers":self.markers,"tape":self.tape,"state":state,"busy":self.round.is_some(),"ready":self.quotes.is_some(),"lag":self.lag,"auto":self.auto,"cash":cash.to_string(),"frozen":frozen.to_string(),"pnl":marked.map(|v|v.to_string()),"conserved":self.ex.is_conserved(),"log":self.log,"positions":positions.iter().filter(|(_,n)|*n>D::ZERO).map(|(s,n)|format!("{s} × {n}")).collect::<Vec<_>>(),"error":self.fee_block,"rates":self.fee_block.is_none().then(||self.legs.iter().map(|l|(l.identity(),Value::String(l.rate.to_string()))).collect::<serde_json::Map<_,_>>())})
     }
 }
 use tokio::time::{Instant, sleep};
@@ -1150,6 +1176,7 @@ mod tests {
     }
     fn desk_with_fee(rate: D) -> Desk {
         let legs = ["1", "2"].map(|id| Leg {
+            condition: if id == "1" { "a" } else { "b" }.into(),
             name: id.into(),
             asset: AssetId::new(id).unwrap(),
             no: AssetId::new(&format!("9{id}")).unwrap(),

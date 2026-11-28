@@ -27,8 +27,32 @@ pub fn single_line(text: &str) -> impl std::fmt::Display + '_ {
     })
 }
 
+pub(crate) enum Content {
+    Text(String),
+    Book(Arc<crate::book::view::BookView>, bool),
+}
+impl From<String> for Content {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+impl std::fmt::Display for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(text),
+            Self::Book(book, pad) => {
+                write!(f, "{book}")?;
+                if *pad {
+                    writeln!(f)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 struct Frame {
-    text: String,
+    payload: Content,
     completed: Option<Receipt>,
 }
 
@@ -77,6 +101,13 @@ struct Writer {
 
 impl Writer {
     fn start(mut output: impl Write + Send + 'static) -> Self {
+        Self::start_with(move |payload| {
+            output.write_all(payload.to_string().as_bytes())?;
+            output.flush()
+        })
+    }
+
+    fn start_with(mut output: impl FnMut(Content) -> io::Result<()> + Send + 'static) -> Self {
         let mailbox = Arc::new(Mailbox::default());
         let worker = Arc::clone(&mailbox);
         let (failure, failed) = watch::channel(None);
@@ -108,10 +139,7 @@ impl Writer {
                     frame
                 };
                 // Terminal IO never holds the producer's mailbox lock.
-                let result = output
-                    .write_all(frame.text.as_bytes())
-                    .and_then(|()| output.flush())
-                    .map(|()| Instant::now());
+                let result = output(frame.payload).map(|()| Instant::now());
                 match result {
                     Ok(at) => {
                         if let Some(receipt) = frame.completed {
@@ -147,11 +175,11 @@ impl Writer {
         Ok(())
     }
 
-    async fn finish(&self, text: String, budget: Duration) -> Result<()> {
+    async fn finish(&self, payload: impl Into<Content>, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         let (sender, mut receiver) = oneshot::channel();
         self.put(Frame {
-            text,
+            payload: payload.into(),
             completed: Some(Receipt { deadline, sender }),
         })?;
         let result = match timeout_at(deadline, &mut receiver).await {
@@ -202,12 +230,27 @@ impl Output {
         }
     }
 
-    pub(crate) fn withdraw_ready<T>(&self, text: String, seal: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_book_sink(
+        mut sink: impl FnMut(Arc<crate::book::view::BookView>) + Send + 'static,
+        stderr: impl Write + Send + 'static,
+    ) -> Self {
+        Self {
+            stdout: Writer::start_with(move |payload| {
+                if let Content::Book(book, _) = payload {
+                    sink(book);
+                }
+                Ok(())
+            }),
+            stderr: Writer::start(stderr),
+        }
+    }
+
+    pub(crate) fn withdraw_ready<T>(&self, payload: Content, seal: impl FnOnce() -> T) -> T {
         let mut mailbox = self.stdout.mailbox.state.lock().expect("output mailbox");
         let result = seal();
         if !mailbox.closing && self.stdout.failed.borrow().is_none() {
             mailbox.next = Some(Frame {
-                text,
+                payload,
                 completed: None,
             });
             self.stdout.mailbox.changed.notify_one();
@@ -215,21 +258,35 @@ impl Output {
         result
     }
     pub fn view(&self, text: String) {
+        self.publish(text.into());
+    }
+
+    pub(crate) fn view_book(&self, book: Arc<crate::book::view::BookView>) {
+        self.publish(Content::Book(book, true));
+    }
+
+    fn publish(&self, payload: Content) {
         let _ = self.stdout.put(Frame {
-            text,
+            payload,
             completed: None,
         });
     }
 
     pub fn diagnostic(&self, message: String) {
         let _ = self.stderr.put(Frame {
-            text: format!("{message}\n"),
+            payload: format!("{message}\n").into(),
             completed: None,
         });
     }
 
     pub async fn finish(&self, text: String) -> Result<()> {
         self.stdout.finish(text, FINAL_OUTPUT_TIMEOUT).await
+    }
+
+    pub(crate) async fn finish_book(&self, book: crate::book::view::BookView) -> Result<()> {
+        self.stdout
+            .finish(Content::Book(Arc::new(book), false), FINAL_OUTPUT_TIMEOUT)
+            .await
     }
 
     pub async fn report_failure(&self, text: String) {
@@ -287,7 +344,7 @@ mod tests {
         });
         writer
             .put(Frame {
-                text: "in progress".to_owned(),
+                payload: "in progress".to_owned().into(),
                 completed: None,
             })
             .unwrap();
@@ -295,7 +352,7 @@ mod tests {
         for text in ["old", "newer", "last"] {
             writer
                 .put(Frame {
-                    text: text.to_owned(),
+                    payload: text.to_owned().into(),
                     completed: None,
                 })
                 .unwrap();
@@ -309,7 +366,8 @@ mod tests {
                 .next
                 .as_ref()
                 .unwrap()
-                .text,
+                .payload
+                .to_string(),
             "last"
         );
         let complete = writer.finish("ready".to_owned(), Duration::from_secs(1));
@@ -339,7 +397,7 @@ mod tests {
         output.view("in progress".into());
         blocked.await.unwrap();
         output.view("Ready".into());
-        output.withdraw_ready("NotReady".into(), || {
+        output.withdraw_ready("NotReady".to_owned().into(), || {
             release.send(()).unwrap();
             assert_eq!(read.recv().unwrap(), "in progress");
             assert!(matches!(
@@ -476,7 +534,7 @@ mod tests {
         });
         writer
             .put(Frame {
-                text: "in progress".to_owned(),
+                payload: "in progress".to_owned().into(),
                 completed: None,
             })
             .unwrap();

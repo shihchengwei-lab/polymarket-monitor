@@ -1,4 +1,4 @@
-use std::{future, ops::ControlFlow, pin::Pin, time::Duration};
+use std::{future, ops::ControlFlow, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{Result, bail, ensure};
 use futures_util::{FutureExt, Stream, StreamExt, future::BoxFuture, stream};
@@ -9,6 +9,7 @@ use crate::{
     book::{
         Audit, NegRiskEventGroup, SNAPSHOT_TIMEOUT, SubscriptionId,
         input::{FrameFailure, Retirement, apply_frame},
+        view::BookView,
     },
     gamma_discovery::{self, Discovery},
     output::{Output, single_line},
@@ -187,7 +188,7 @@ impl WatchControl<'_> {
         &mut self,
         mut retirement: Retirement<'_>,
         mut stopped: Option<Result<()>>,
-    ) -> ControlFlow<Result<()>, Result<Option<String>>> {
+    ) -> ControlFlow<Result<()>, Result<Option<BookView>>> {
         // Drain reliable input even when stop has won. An accepted Gamma
         // closure owns terminal output through its final write confirmation.
         loop {
@@ -229,24 +230,22 @@ impl WatchControl<'_> {
 fn publish_view(
     transport: &Transport,
     group: &NegRiskEventGroup,
-    last: &mut String,
+    last: &mut Option<Arc<BookView>>,
     output: &Output,
 ) -> bool {
-    let view = group.render();
-    let pending = (*last != view).then(|| format!("{view}\n"));
-    let accepted = transport.while_accepting(|| {
-        if let Some(text) = pending {
-            output.view(text);
+    let view = group.view();
+    let changed = last.as_deref() != Some(&view);
+    transport.while_accepting(|| {
+        if changed {
+            let view = Arc::new(view);
+            output.view_book(view.clone());
+            *last = Some(view);
         }
-    });
-    if accepted {
-        *last = view;
-    }
-    accepted
+    })
 }
 
 fn publish_current(group: &NegRiskEventGroup, output: &Output) {
-    output.view(format!("{}\n", group.render()));
+    output.view_book(Arc::new(group.view()));
 }
 
 async fn finish_subscription(
@@ -317,7 +316,7 @@ async fn finish_subscription(
     }
     if let Ok(Some(view)) = result {
         return Ok(SessionEnd::Finished(tokio::select! {
-            biased; stopped=&mut control.stop=>stopped, result=output.finish(view)=>result
+            biased; stopped=&mut control.stop=>stopped, result=output.finish_book(view)=>result
         }));
     }
     publish_current(group, output);
@@ -398,7 +397,7 @@ async fn session(
     recovery.state = RecoveryState::Idle;
     let mut refresh = interval_at(started + Duration::from_secs(1), Duration::from_secs(1));
     refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_view = String::new();
+    let mut last_view = None;
     let mut ready = false;
     let mut next_check = started;
     type AuditResult = (Audit, Result<Option<RestBook>>);
@@ -607,7 +606,7 @@ async fn watch_group_loop(
     group.end_consumer(Instant::now());
     let result = group.finish_with(result).await;
     if group.event_closed() && !control.once {
-        let output = control.output.finish(group.render()).await;
+        let output = control.output.finish_book(group.view()).await;
         if let (Err(prior), Err(last)) = (&result, &output)
             && let Some(writer) = last.downcast_ref::<crate::output::WriteFailure>()
             && crate::book::has_failure(prior, &|cause| writer.same(cause))
@@ -1976,7 +1975,7 @@ mod tests {
             let mut group = cutoff_group();
             let recorded = Recorded::default();
             let output = Output::new(recorded.clone(), io::sink());
-            let mut last = String::new();
+            let mut last = None;
             assert!(transport.while_accepting(|| {}));
             if publish_first {
                 assert!(publish_view(&transport, &group, &mut last, &output));
@@ -1992,7 +1991,7 @@ mod tests {
             assert!(!transport.enqueue(&sender, Payload::Raw("[]".into())));
             assert!(!transport.frames.is_closed());
             assert!(!publish_view(&transport, &group, &mut last, &output));
-            assert_eq!(last.is_empty(), !publish_first);
+            assert_eq!(last.is_none(), !publish_first);
             let result = finish_subscription(
                 transport,
                 Cutoff::Closed(None),
