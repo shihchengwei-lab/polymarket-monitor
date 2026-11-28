@@ -93,23 +93,52 @@ impl std::fmt::Display for ExpiredSubscription {
 
 impl std::error::Error for ExpiredSubscription {}
 
+#[derive(Default)]
+enum Heartbeat {
+    #[default]
+    Idle,
+    Writing,
+    Confirming(Instant),
+    AwaitingPong(Instant),
+}
+
+#[derive(Default)]
+struct Control {
+    write_due: Option<Instant>,
+    heartbeat: Heartbeat,
+}
+
+impl Control {
+    fn deadline(&self) -> Option<(Instant, &'static str)> {
+        let pong = match self.heartbeat {
+            Heartbeat::Confirming(due) | Heartbeat::AwaitingPong(due) => {
+                Some((due, "WebSocket PONG timed out"))
+            }
+            Heartbeat::Idle | Heartbeat::Writing => None,
+        };
+        let write = self
+            .write_due
+            .map(|due| (due, "WebSocket heartbeat write timed out"));
+        pong.into_iter().chain(write).min_by_key(|&(due, _)| due)
+    }
+}
+
 enum IngressState {
-    Accepting { pong_due: Option<Instant> },
+    Accepting(Control),
     Failed(Instant, anyhow::Error),
     Sealed,
 }
 
 impl IngressState {
-    fn at(&mut self, now: Instant) -> Result<&mut Option<Instant>> {
-        if let Self::Accepting {
-            pong_due: Some(due),
-        } = self
-            && now >= *due
+    fn at(&mut self, now: Instant) -> Result<&mut Control> {
+        if let Self::Accepting(control) = self
+            && let Some((due, reason)) = control.deadline()
+            && now >= due
         {
-            *self = Self::Failed(*due, anyhow::anyhow!("WebSocket PONG timed out"));
+            *self = Self::Failed(due, anyhow::anyhow!(reason));
         }
         match self {
-            Self::Accepting { pong_due } => Ok(pong_due),
+            Self::Accepting(control) => Ok(control),
             Self::Failed(..) | Self::Sealed => bail!("WebSocket ingress sealed"),
         }
     }
@@ -138,28 +167,60 @@ impl Ingress {
 
     fn deadline(&self) -> Result<Option<Instant>> {
         let mut state = self.lock();
-        Ok(*state.at(Instant::now())?)
+        Ok(state.at(Instant::now())?.deadline().map(|(due, _)| due))
     }
 
-    fn arm_ping(&self, timeout: Duration) -> Result<bool> {
+    fn begin_ping(&self) -> Result<bool> {
         let mut state = self.lock();
         let now = Instant::now();
-        let deadline = state.at(now)?;
-        let first = deadline.is_none();
-        deadline.get_or_insert(now + timeout);
-        Ok(first)
+        let control = state.at(now)?;
+        if !matches!(control.heartbeat, Heartbeat::Idle) || control.write_due.is_some() {
+            return Ok(false);
+        }
+        control.heartbeat = Heartbeat::Writing;
+        control.write_due = Some(now + SEND_TIMEOUT);
+        Ok(true)
+    }
+
+    fn begin_protocol_write(&self) -> Result<()> {
+        let mut state = self.lock();
+        let now = Instant::now();
+        state.at(now)?.write_due.get_or_insert(now + SEND_TIMEOUT);
+        Ok(())
+    }
+
+    fn confirming_ping(&self, timeout: Duration) -> Result<()> {
+        let mut state = self.lock();
+        let now = Instant::now();
+        let control = state.at(now)?;
+        debug_assert!(matches!(control.heartbeat, Heartbeat::Writing));
+        control.heartbeat = Heartbeat::Confirming(now + timeout);
+        Ok(())
+    }
+
+    fn finish_flush(&self, flushed: bool) -> Result<()> {
+        let mut state = self.lock();
+        let control = state.at(Instant::now())?;
+        if let Heartbeat::Confirming(due) = control.heartbeat {
+            control.heartbeat = if flushed {
+                Heartbeat::AwaitingPong(due)
+            } else {
+                Heartbeat::Writing
+            };
+        }
+        if flushed {
+            control.write_due = None;
+        }
+        Ok(())
     }
 
     fn pong(&self) -> Result<()> {
         let mut state = self.lock();
-        *state.at(Instant::now())? = None;
+        let control = state.at(Instant::now())?;
+        if matches!(control.heartbeat, Heartbeat::AwaitingPong(_)) {
+            control.heartbeat = Heartbeat::Idle;
+        }
         Ok(())
-    }
-
-    fn write_budget(&self) -> Result<Duration> {
-        Ok(self.deadline()?.map_or(SEND_TIMEOUT, |due| {
-            SEND_TIMEOUT.min(due.saturating_duration_since(Instant::now()))
-        }))
     }
 
     #[cfg(test)]
@@ -168,13 +229,9 @@ impl Ingress {
         S: Sink<Message, Error = E> + Unpin,
         E: std::error::Error + Send + Sync + 'static,
     {
-        let budget = self.write_budget()?;
-        let mut write = PendingWrite::new(WriteKind::QueuePing, budget);
-        timeout(
-            budget,
-            poll_fn(|cx| write.poll(cx, socket, self, pong_timeout)),
-        )
-        .await?
+        assert!(self.begin_ping()?);
+        let mut write = PendingWrite::QueuePing;
+        poll_fn(|cx| write.poll(cx, socket, self, pong_timeout)).await
     }
 
     fn admit(&self, frames: &mpsc::Sender<Frame>, text: String) -> bool {
@@ -283,7 +340,7 @@ impl Transport {
     fn channel() -> (Self, mpsc::Sender<Frame>, oneshot::Receiver<()>) {
         let (frames, receive) = mpsc::channel(INGRESS_FRAMES);
         let ingress = Arc::new(Ingress {
-            state: Mutex::new(IngressState::Accepting { pong_due: None }),
+            state: Mutex::new(IngressState::Accepting(Control::default())),
             bytes: Arc::new(Semaphore::new(INGRESS_BYTES)),
         });
         let (stop, stopped) = oneshot::channel::<()>();
@@ -366,6 +423,11 @@ impl Transport {
     }
 
     #[cfg(test)]
+    pub(crate) fn begin_protocol_write_for_test(&self) {
+        self.ingress.begin_protocol_write().unwrap();
+    }
+
+    #[cfg(test)]
     pub(crate) fn buffered_for_test(
         messages: impl IntoIterator<Item = String>,
     ) -> (Self, mpsc::Sender<Frame>) {
@@ -427,25 +489,13 @@ where
     })
 }
 
-enum WriteKind {
+enum PendingWrite {
     Protocol,
     QueuePing,
-    FlushPing { acknowledged: bool },
-}
-
-struct PendingWrite {
-    kind: WriteKind,
-    due: Instant,
+    FlushPing,
 }
 
 impl PendingWrite {
-    fn new(kind: WriteKind, budget: Duration) -> Self {
-        Self {
-            kind,
-            due: Instant::now() + budget,
-        }
-    }
-
     fn poll<S, E>(
         &mut self,
         cx: &mut TaskContext<'_>,
@@ -457,29 +507,23 @@ impl PendingWrite {
         S: Sink<Message, Error = E> + Unpin,
         E: std::error::Error + Send + Sync + 'static,
     {
+        ingress.deadline()?;
         let mut socket = Pin::new(socket);
-        if matches!(self.kind, WriteKind::QueuePing) {
-            ready!(socket.as_mut().poll_ready(cx)).map_err(anyhow::Error::from)?;
-            socket
-                .as_mut()
-                .start_send(Message::Text("PING".into()))
-                .map_err(anyhow::Error::from)?;
-            self.kind = WriteKind::FlushPing {
-                acknowledged: false,
-            };
+        if matches!(self, Self::QueuePing) {
+            let ready_to_send = socket.as_mut().poll_ready(cx);
+            ingress.deadline()?;
+            ready!(ready_to_send).map_err(anyhow::Error::from)?;
+            let queued = socket.as_mut().start_send(Message::Text("PING".into()));
+            ingress.deadline()?;
+            queued?;
+            *self = Self::FlushPing;
         }
-        // A competing seal must see the provisional cutoff even inside a
-        // stalled flush poll. Remove it if this poll could not finish writing.
-        let armed = matches!(
-            self.kind,
-            WriteKind::FlushPing {
-                acknowledged: false
-            }
-        ) && ingress.arm_ping(pong_timeout)?;
+        // The deadline must be visible to a concurrent seal even if this poll stalls.
+        if matches!(self, Self::FlushPing) {
+            ingress.confirming_ping(pong_timeout)?;
+        }
         let result = socket.poll_flush(cx);
-        if armed && result.is_pending() {
-            *ingress.lock().at(Instant::now())? = None;
-        }
+        ingress.finish_flush(matches!(result, Poll::Ready(Ok(()))))?;
         result.map_err(anyhow::Error::from)
     }
 }
@@ -504,47 +548,41 @@ where
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pending: Option<PendingWrite> = None;
     loop {
-        let pong_due = ingress.deadline()?;
-        let write_due = pending.as_ref().map(|write| write.due);
+        let cutoff = ingress.deadline()?;
         tokio::select! {
             biased;
-            _ = wait_deadline(pong_due) => bail!("WebSocket PONG timed out"),
-            _ = wait_deadline(write_due) => {
-                ingress.deadline()?;
-                bail!("WebSocket heartbeat write timed out");
-            }
-            _ = interval.tick(), if pending.is_none() => {
-                pending = Some(PendingWrite::new(WriteKind::QueuePing, ingress.write_budget()?));
+            _ = wait_deadline(cutoff) => { ingress.deadline()?; }
+            _ = interval.tick() => {
+                if ingress.begin_ping()? {
+                    debug_assert!(pending.is_none());
+                    pending = Some(PendingWrite::QueuePing);
+                }
             }
             event = poll_fn(|cx| {
-                if let Some(write) = &mut pending {
-                    if let Poll::Ready(result) = write.poll(cx, socket, ingress, timing.timeout) {
-                        return Poll::Ready(result.map(|()| SocketEvent::Flushed));
-                    }
+                if let Some(write) = &mut pending
+                    && let Poll::Ready(result) = write.poll(cx, socket, ingress, timing.timeout)
+                {
+                    return Poll::Ready(result.map(|()| SocketEvent::Flushed));
                 }
-                // tungstenite may also attempt an automatic Pong flush during
-                // read. Its WouldBlock path still polls the readable side.
-                Pin::new(&mut *socket).poll_next(cx).map(|item| {
-                    Ok(SocketEvent::Incoming(item.context("WebSocket stream ended")??))
-                })
+                // The pinned WebSocket library may flush an automatic Pong on a read.
+                // Its WouldBlock path still polls readable data. Only an explicit
+                // successful flush confirms a queued text PING.
+                let read = Pin::new(&mut *socket).poll_next(cx);
+                if matches!(read, Poll::Ready(Some(Ok(Message::Ping(_))))) {
+                    ingress.begin_protocol_write()?;
+                    if pending.is_none() {
+                        pending = Some(PendingWrite::Protocol);
+                    }
+                } else {
+                    ingress.deadline()?;
+                }
+                read.map(|item| Ok(SocketEvent::Incoming(item.context("WebSocket stream ended")??)))
             }) => {
-                ingress.deadline()?;
                 match event? {
                     SocketEvent::Flushed => pending = None,
-                    SocketEvent::Incoming(Message::Text(text)) if text.trim() == "PONG" => {
-                        ingress.pong()?;
-                        // A read can itself flush a queued ping along with an automatic Pong.
-                        if let Some(PendingWrite { kind: WriteKind::FlushPing { acknowledged }, .. }) = &mut pending {
-                            *acknowledged = true;
-                        }
-                    }
+                    SocketEvent::Incoming(Message::Text(text)) if text.trim() == "PONG" => ingress.pong()?,
                     SocketEvent::Incoming(Message::Text(text)) => {
                         if !ingress.admit(frames, text) { return Ok(()); }
-                    }
-                    SocketEvent::Incoming(Message::Ping(_)) => {
-                        if pending.is_none() {
-                            pending = Some(PendingWrite::new(WriteKind::Protocol, ingress.write_budget()?));
-                        }
                     }
                     SocketEvent::Incoming(Message::Close(frame)) => bail!("WebSocket closed: {frame:?}"),
                     SocketEvent::Incoming(Message::Binary(_)) => bail!("unexpected binary market message"),
@@ -605,6 +643,7 @@ mod tests {
 
     struct WriteGate {
         io: tokio::io::DuplexStream,
+        blocked_from: Instant,
         open: Pin<Box<tokio::time::Sleep>>,
     }
 
@@ -624,7 +663,9 @@ mod tests {
             cx: &mut TaskContext<'_>,
             bytes: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            ready!(std::future::Future::poll(self.open.as_mut(), cx));
+            if Instant::now() >= self.blocked_from {
+                ready!(std::future::Future::poll(self.open.as_mut(), cx));
+            }
             Pin::new(&mut self.io).poll_write(cx, bytes)
         }
 
@@ -632,7 +673,9 @@ mod tests {
             mut self: Pin<&mut Self>,
             cx: &mut TaskContext<'_>,
         ) -> Poll<std::io::Result<()>> {
-            ready!(std::future::Future::poll(self.open.as_mut(), cx));
+            if Instant::now() >= self.blocked_from {
+                ready!(std::future::Future::poll(self.open.as_mut(), cx));
+            }
             Pin::new(&mut self.io).poll_flush(cx)
         }
 
@@ -655,6 +698,7 @@ mod tests {
             let mut client = WebSocketStream::from_raw_socket(
                 WriteGate {
                     io: client,
+                    blocked_from: started,
                     open: Box::pin(sleep_until(at(130))),
                 },
                 Role::Client,
@@ -712,6 +756,169 @@ mod tests {
             );
             worker.abort();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_after_the_next_ping_times_out_despite_an_earlier_reply() {
+        late_heartbeat_reply(21).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_old_reply_cannot_acknowledge_an_overlapping_ping() {
+        late_heartbeat_reply(23).await;
+    }
+
+    async fn late_heartbeat_reply(old_reply: u64) {
+        use futures_util::FutureExt;
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+        let started = Instant::now();
+        let at = |secs| started + Duration::from_secs(secs);
+        let (client, server) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(
+            WriteGate {
+                io: client,
+                blocked_from: at(20),
+                open: Box::pin(sleep_until(at(22))),
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let (transport, tx) = Transport::local();
+        let ingress = transport.ingress.clone();
+        tokio::spawn(async move {
+            let result = drive_market(&mut client, started, HEARTBEAT_TIMING, &tx, &ingress).await;
+            ingress.finish(result);
+        });
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            server.next().now_or_never().unwrap().unwrap().unwrap(),
+            Message::Text("PING".into())
+        );
+
+        let mut second_ping = None;
+        for second in 20..=30 {
+            tokio::time::advance(at(second).duration_since(Instant::now())).await;
+            tokio::task::yield_now().await;
+            if let Some(ping) = server.next().now_or_never() {
+                assert!(
+                    second > old_reply,
+                    "extra PING at {second}s before the old reply"
+                );
+                assert_eq!(ping.unwrap().unwrap(), Message::Text("PING".into()));
+                second_ping.get_or_insert(second);
+            }
+            if second == old_reply {
+                server.send(Message::Text("PONG".into())).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let due = at(second_ping.expect("the next heartbeat slot must send") + 20);
+        tokio::time::advance((due - Duration::from_millis(1)).duration_since(Instant::now())).await;
+        assert!(transport.idle_sample().unwrap().is_some());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let (frames, result) = transport.seal();
+        assert_eq!(frames.cutoff, due);
+        assert!(result.unwrap_err().to_string().contains("PONG timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_text_and_control_pong_do_not_acknowledge_an_unflushed_ping() {
+        use futures_util::FutureExt;
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+        let started = Instant::now();
+        let at = |ms| started + Duration::from_millis(ms);
+        let (client, server) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(
+            WriteGate {
+                io: client,
+                blocked_from: at(10_000),
+                open: Box::pin(sleep_until(at(12_000))),
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let (transport, tx) = Transport::local();
+        let ingress = transport.ingress.clone();
+        tokio::spawn(async move {
+            let result = drive_market(&mut client, started, HEARTBEAT_TIMING, &tx, &ingress).await;
+            ingress.finish(result);
+        });
+        for (ms, message) in [
+            (9_000, Some(Message::Text("PONG".into()))),
+            (10_000, None),
+            (11_000, Some(Message::Text("PONG".into()))),
+            (12_000, None),
+            (12_500, Some(Message::Pong(vec![1]))),
+        ] {
+            tokio::time::advance(at(ms).duration_since(Instant::now())).await;
+            if let Some(message) = message {
+                server.send(message).await.unwrap();
+            }
+            tokio::task::yield_now().await;
+            let ping = server.next().now_or_never();
+            if ms == 12_000 {
+                assert_eq!(
+                    ping.unwrap().unwrap().unwrap(),
+                    Message::Text("PING".into())
+                );
+            } else {
+                assert!(ping.is_none());
+            }
+        }
+        tokio::time::advance(at(31_999).duration_since(Instant::now())).await;
+        assert!(transport.idle_sample().unwrap().is_some());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let (frames, result) = transport.seal();
+        assert_eq!(frames.cutoff, at(32_000));
+        assert!(result.unwrap_err().to_string().contains("PONG timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_worker_publishes_the_original_protocol_write_cut() {
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let (client, server) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(
+            WriteGate {
+                io: client,
+                blocked_from: at(1_000),
+                open: Box::pin(sleep_until(at(7_000))),
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let (transport, tx) = Transport::local();
+        let ingress = transport.ingress.clone();
+        let worker = tokio::spawn(async move {
+            let result = drive_market(&mut client, start, HEARTBEAT_TIMING, &tx, &ingress).await;
+            ingress.finish(result);
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        server.send(Message::Ping(vec![1])).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(5_100)).await;
+        worker.await.unwrap();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let (frames, result) = transport.seal();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("heartbeat write timed out")
+        );
+        assert_eq!(frames.cutoff, at(6_000));
     }
 
     fn subscription() -> Subscription {
@@ -891,7 +1098,7 @@ mod tests {
         };
         let mut send = Box::pin(ingress.send_ping(&mut sink, budget));
         assert!(poll!(&mut send).is_pending());
-        assert_eq!(ingress.deadline().unwrap(), None);
+        assert_eq!(ingress.deadline().unwrap(), Some(start + SEND_TIMEOUT));
         let _ = send.await;
     }
 
@@ -900,10 +1107,12 @@ mod tests {
         for idle in [true, false] {
             let (wire, tx) = Transport::local();
             let timing = HEARTBEAT_TIMING;
-            wire.ingress.arm_ping(timing.timeout).unwrap();
+            assert!(wire.ingress.begin_ping().unwrap());
+            wire.ingress.confirming_ping(timing.timeout).unwrap();
+            wire.ingress.finish_flush(true).unwrap();
             let due = Instant::now() + timing.timeout;
             tokio::time::advance(timing.interval).await;
-            wire.ingress.arm_ping(timing.timeout).unwrap();
+            assert!(!wire.ingress.begin_ping().unwrap());
             tokio::time::advance(timing.timeout).await;
             if idle {
                 assert!(wire.idle_sample().is_err());
@@ -914,6 +1123,110 @@ mod tests {
             assert_eq!(frames.cutoff, due);
             assert!(result.unwrap_err().to_string().contains("PONG timed out"));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_write_cut_is_shared_before_worker_finishes() {
+        for (worker_first, sample, before_cut) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (false, false, true),
+        ] {
+            let (wire, tx) = Transport::local();
+            let ingress = wire.ingress.clone();
+            ingress.begin_protocol_write().unwrap();
+            let due = Instant::now() + SEND_TIMEOUT;
+            tokio::time::advance(SEND_TIMEOUT - Duration::from_millis(1)).await;
+            assert!(wire.idle_sample().unwrap().is_some());
+            if !sample {
+                assert!(wire.enqueue(&tx, Payload::Raw("first".into())));
+                assert!(wire.enqueue(&tx, Payload::Raw("second".into())));
+            }
+            if !before_cut {
+                tokio::time::advance(Duration::from_millis(1)).await;
+                if worker_first {
+                    tokio::time::advance(Duration::from_millis(100)).await;
+                    ingress.finish(Err(anyhow::anyhow!("worker woke late")));
+                    tokio::time::advance(Duration::from_millis(100)).await;
+                }
+                if sample {
+                    assert!(wire.idle_sample().is_err());
+                    assert!(!wire.enqueue(&tx, Payload::Raw("late".into())));
+                }
+            }
+            let (mut frames, result) = wire.seal();
+            if before_cut {
+                assert_eq!(frames.cutoff, due - Duration::from_millis(1));
+                result.unwrap();
+                tokio::time::advance(Duration::from_millis(101)).await;
+                ingress.finish(Err(anyhow::anyhow!("worker woke after stop")));
+            } else {
+                assert_eq!(frames.cutoff, due);
+                assert!(result.unwrap_err().to_string().contains("write timed out"));
+            }
+            if !sample {
+                for expected in ["first", "second"] {
+                    let frame = frames.frames.try_recv().unwrap();
+                    assert!(matches!(frame.payload, Payload::Raw(text) if text == expected));
+                }
+            }
+            assert!(frames.frames.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn earlier_deadline_wins_even_when_both_are_overdue() {
+        for (write_starts, observed, cutoff, reason) in [
+            (24, 31, 29, "write timed out"),
+            (28, 34, 30, "PONG timed out"),
+        ] {
+            let (wire, _) = Transport::local();
+            let start = Instant::now();
+            let at = |secs| start + Duration::from_secs(secs);
+            let ingress = &wire.ingress;
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(ingress.begin_ping().unwrap());
+            ingress.confirming_ping(HEARTBEAT_TIMING.timeout).unwrap();
+            ingress.finish_flush(true).unwrap();
+            tokio::time::advance(at(write_starts).duration_since(Instant::now())).await;
+            ingress.begin_protocol_write().unwrap();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            ingress.begin_protocol_write().unwrap();
+            tokio::time::advance(at(observed).duration_since(Instant::now())).await;
+            let (frames, result) = wire.seal();
+            assert_eq!(frames.cutoff, at(cutoff));
+            assert!(result.unwrap_err().to_string().contains(reason));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_successful_flush_cannot_clear_a_write_cut() {
+        use futures_util::FutureExt;
+        let (wire, _) = Transport::local();
+        let ingress = &wire.ingress;
+        ingress.begin_protocol_write().unwrap();
+        let due = Instant::now() + SEND_TIMEOUT;
+        tokio::time::advance(SEND_TIMEOUT - Duration::from_millis(1)).await;
+        let mut sink = DelayedSink {
+            writable: Box::pin(sleep_until(Instant::now())),
+            sent: false,
+            flush: Some(Box::new(|| {
+                let _ = tokio::time::advance(Duration::from_millis(2)).now_or_never();
+                Poll::Ready(Ok(()))
+            })),
+        };
+        assert!(
+            std::future::poll_fn(|cx| {
+                PendingWrite::Protocol.poll(cx, &mut sink, ingress, HEARTBEAT_TIMING.timeout)
+            })
+            .await
+            .is_err()
+        );
+        assert!(wire.idle_sample().is_err());
+        let (frames, result) = wire.seal();
+        assert_eq!(frames.cutoff, due);
+        assert!(result.unwrap_err().to_string().contains("write timed out"));
     }
 
     #[tokio::test]

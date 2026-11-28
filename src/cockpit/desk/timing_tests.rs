@@ -1797,6 +1797,59 @@ async fn resting_maker_print_uses_exact_expiry() {
     }
 }
 #[tokio::test(start_paused = true)]
+async fn transport_write_cut_prevents_ioc_due_at_the_same_time() {
+    let mut m = DeadlineMarket::new(5_000, 0, 0).await;
+    m.send_hedge(1_000, 940_000).await;
+    let (transport, _sender) = crate::transport::Transport::local();
+    m.at(1_000_000).await;
+    transport.begin_protocol_write_for_test();
+    m.at(5_999_000).await;
+    m.idle();
+    m.clocks.lock().unwrap().clear();
+    m.at(6_000_000).await;
+    let error = crate::monitor::retire_transport_for_test(&mut m.group, transport, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("heartbeat write timed out"));
+    let cutoff = m.origin + Duration::from_secs(6);
+    assert!(m.clocks.lock().unwrap().iter().all(|&at| at < cutoff));
+    assert_eq!(*m.interrupts.lock().unwrap(), vec![cutoff]);
+    let v = m.view().await;
+    assert_eq!(v["slots"][0]["shares"], "5");
+    assert_eq!(v["slots"][1]["shares"], "0");
+    assert_eq!(v["conserved"], true);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transport_write_cut_drains_accepted_trades_before_closing_the_order() {
+    use crate::transport::{Payload, Transport};
+
+    let mut m = DeadlineMarket::new(1_000, 0, 0).await;
+    m.command("/desk/lag/20").await;
+    m.command("/desk/fire").await;
+    m.at(20_000).await;
+    m.idle();
+    let (transport, sender) = Transport::local();
+    m.at(1_000_000).await;
+    transport.begin_protocol_write_for_test();
+    for (at, size) in [(5_998_000, "7"), (5_999_000, "3")] {
+        m.at(at).await;
+        let trade = json!({"event_type":"last_trade_price","asset_id":"1","price":".40","size":size,"side":"SELL","timestamp":at});
+        assert!(transport.enqueue(&sender, Payload::Raw(trade.to_string())));
+    }
+    m.at(6_000_000).await;
+    let error = crate::monitor::retire_transport_for_test(&mut m.group, transport, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("heartbeat write timed out"));
+    let v = m.view().await;
+    assert_eq!(v["slots"][0]["shares"], "8");
+    assert_eq!(v["orders"][0]["effective_ms"], 6_000);
+    assert_eq!(v["frozen"], "0");
+    assert_eq!(v["conserved"], true);
+}
+
+#[tokio::test(start_paused = true)]
 async fn idle_sample_owns_reconciliation_cut_and_hedge_result() {
     for crosses in [true, false] {
         let mut m = DeadlineMarket::new(1000, 0, 0).await;

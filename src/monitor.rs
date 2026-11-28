@@ -361,6 +361,29 @@ fn market_tick(group: &mut NegRiskEventGroup, transport: &Transport) -> Option<C
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn retire_transport_for_test(
+    group: &mut NegRiskEventGroup,
+    transport: Transport,
+    stop: bool,
+) -> Result<()> {
+    let output = Output::new(std::io::sink(), std::io::sink());
+    let mut control = WatchControl {
+        once: false,
+        output: &output,
+        stop: Box::pin(std::future::pending()),
+    };
+    let cutoff = if stop {
+        Cutoff::Stop(Ok(()))
+    } else {
+        market_tick(group, &transport).expect("the monitor must observe the write cutoff")
+    };
+    match finish_subscription(transport, cutoff, group, &mut control).await? {
+        SessionEnd::Finished(result) => result,
+        _ => Ok(()),
+    }
+}
+
 async fn session(
     endpoints: &Endpoints<'_>,
     gamma: &mut GammaPoll<'_>,
