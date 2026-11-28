@@ -2,7 +2,7 @@ use super::Screen;
 use crate::wire::{PublicTrade, Side as TradeSide};
 use crate::{
     book::{BasketUpdate, CommittedBook, MarketInput},
-    gamma_discovery::{self, Discovery},
+    gamma_discovery::{self, BasketEligibility, Discovery},
     paper::{
         AccountId, AssetId, Cash, ClientOrderId, OrderKey, Price, Quantity, Shares, Side,
         chaos_exchange::ChaosExchange,
@@ -71,11 +71,12 @@ async fn roster(client: &Client, slug: &str, gamma: &str, clob: &str) -> Result<
     else {
         anyhow::bail!("事件未開放")
     };
+    let parts = group.into_parts();
     ensure!(
-        !group.quotes_only(),
+        parts.basket_eligibility == BasketEligibility::FullRoster,
         "此事件僅提供具名選項報價，紙上交易已停用"
     );
-    let specs = group.into_parts().1;
+    let specs = parts.markets;
     ensure!(specs.len() <= 64, "紙上引擎最多支援 64 腿");
     let mut legs = Vec::new();
     for s in specs {

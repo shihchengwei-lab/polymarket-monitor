@@ -26,6 +26,8 @@
 
 ## 程式庫接入
 
+直接使用 `gamma_discovery::discover()` 時，`Discovery::Open(spec)` 表示可監控報價。可用 `spec.basket_eligibility()` 讀取整籃資格。`spec.into_parts()` 回傳具名的 `GroupParts`，其中 `basket_eligibility` 保留同一判定。原本解構三元組的呼叫端須改用具名欄位。`FullRoster` 表示名冊完整，仍須同步後才能使用整籃功能。`QuotesOnly` 表示名冊僅供報價。
+
 程式庫用 `group.refresh_discovery(&client, base, ttl)` 查詢並套用 Gamma 名冊。每個群組同時只保留一筆查詢。用 `tokio::select!` 同時等行情與查詢，行情先到可立即處理，下次呼叫會沿用原請求的端點與有效期。若關場或結算容量終止已提交，取消等待只會中止這次呼叫。再次查詢會繼續等待同一筆撤單回執，並取得先前尚未交付的結果。要放棄未完成的 HTTP 請求或改用其他端點，先呼叫 `cancel_gamma_refresh()`。查詢失敗或名冊已過期時保留原核准期限。
 
 用 `open_input` 取得本次訂閱識別碼，呼叫 `admit_raw` 或 `admit_event` 入列，再用 `advance_input` 依序處理。入列時記錄本機接收時間。換名冊、呼叫 `close_input` 或遇到整批行情錯誤時，群組先處理缺口前已受理的行情，再撤銷紙上報價並讀完已受理的結算。若關場與壞幀同時發生，非同步入口會先完成已受理的本機撤單回執，再回報原始錯誤。若封存時另有傳輸故障，完整錯誤鏈會保留兩個原因。結算容量用盡仍可按錯誤型別辨識。舊識別碼送來的資料會回傳 `Ok(false)`。即使沒有收到訊息，也要以 `snapshot_deadline()` 和 `reconciliation_deadline()` 中最早的期限排定喚醒並呼叫 `advance_input(source)`。首照到期會隔離該 Token；空佇列以取樣所得的本機時刻裁決。若取樣時已達交叉恢復期限，該次呼叫即封存輸入、保留已受理結算並回傳錯誤，可重新呼叫 `open_input()`。

@@ -15,7 +15,7 @@ mod live_paper;
 pub(crate) mod view;
 use crate::paper::{Error as PaperError, chaos_exchange::ChaosExchange};
 
-use crate::gamma_discovery::{self, Discovery, GroupSpec};
+use crate::gamma_discovery::{self, BasketEligibility, Discovery, GroupParts, GroupSpec};
 use crate::wire::{Change, Event, Level, RestBook, Side, Snapshot, validate_tick};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -772,7 +772,7 @@ impl Roster {
     }
 
     fn matches(&self, spec: &GroupSpec, resolved: &HashSet<String>) -> bool {
-        spec.quotes_only() == self.quotes_only
+        (spec.basket_eligibility() == BasketEligibility::QuotesOnly) == self.quotes_only
             && spec.markets().len() == self.markets.len()
             && spec
                 .markets()
@@ -1523,10 +1523,10 @@ impl NegRiskEventGroup {
                 } = &mut self.membership
                     && roster.matches(&spec, &self.resolved)
                 {
-                    let (title, specs, deadline) = spec.into_parts();
-                    roster.refresh(specs);
-                    self.title = title;
-                    *valid_until = deadline;
+                    let parts = spec.into_parts();
+                    roster.refresh(parts.markets);
+                    self.title = parts.title;
+                    *valid_until = parts.valid_until;
                     None
                 } else {
                     Some(Discovery::Open(spec))
@@ -1550,11 +1550,18 @@ impl NegRiskEventGroup {
         let roster = self.take_roster();
         self.membership = match next {
             Discovery::Open(spec) => {
-                let quotes_only = spec.quotes_only();
-                let (title, specs, valid_until) = spec.into_parts();
+                let GroupParts {
+                    title,
+                    markets,
+                    valid_until,
+                    basket_eligibility,
+                } = spec.into_parts();
                 self.title = title;
                 Membership::Open {
-                    roster: Roster::new(specs, quotes_only),
+                    roster: Roster::new(
+                        markets,
+                        basket_eligibility == BasketEligibility::QuotesOnly,
+                    ),
                     valid_until,
                 }
             }

@@ -78,29 +78,44 @@ impl MarketSpec {
     }
 }
 
+/// Whether discovery returned a complete event roster for basket monitoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BasketEligibility {
+    /// The full roster is available. A live group must still synchronize before trading.
+    FullRoster,
+    /// Only active named outcomes are included and a complete basket cannot be computed.
+    QuotesOnly,
+}
+
 #[derive(Debug)]
 pub struct GroupSpec {
-    title: String,
-    markets: Vec<MarketSpec>,
-    valid_until: Instant,
-    quotes_only: bool,
+    parts: GroupParts,
+}
+
+/// Owned discovery data, including the basket eligibility of its market list.
+#[derive(Debug)]
+pub struct GroupParts {
+    pub title: String,
+    pub markets: Vec<MarketSpec>,
+    pub valid_until: Instant,
+    pub basket_eligibility: BasketEligibility,
 }
 
 impl GroupSpec {
-    pub(crate) fn quotes_only(&self) -> bool {
-        self.quotes_only
+    pub fn basket_eligibility(&self) -> BasketEligibility {
+        self.parts.basket_eligibility
     }
 
     pub fn markets(&self) -> &[MarketSpec] {
-        &self.markets
+        &self.parts.markets
     }
 
     pub fn valid_until(&self) -> Instant {
-        self.valid_until
+        self.parts.valid_until
     }
 
-    pub fn into_parts(self) -> (String, Vec<MarketSpec>, Instant) {
-        (self.title, self.markets, self.valid_until)
+    pub fn into_parts(self) -> GroupParts {
+        self.parts
     }
 }
 
@@ -180,10 +195,16 @@ impl EventRecord {
         );
         markets.sort_unstable_by(|a, b| a.condition.cmp(&b.condition));
         Ok(GroupSpec {
-            title: self.title,
-            markets,
-            valid_until,
-            quotes_only,
+            parts: GroupParts {
+                title: self.title,
+                markets,
+                valid_until,
+                basket_eligibility: if quotes_only {
+                    BasketEligibility::QuotesOnly
+                } else {
+                    BasketEligibility::FullRoster
+                },
+            },
         })
     }
 }
@@ -291,13 +312,32 @@ async fn list_from(
     Ok(events)
 }
 
-async fn list_page<T: serde::de::DeserializeOwned>(
+#[derive(Debug)]
+struct PageOverLimit {
+    size: u32,
+    offset: u32,
+    returned: usize,
+}
+
+impl std::fmt::Display for PageOverLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Gamma returned too many events at offset {}: requested {}, received {}",
+            self.offset, self.size, self.returned
+        )
+    }
+}
+
+impl std::error::Error for PageOverLimit {}
+
+async fn list_page(
     client: &Client,
     base: &str,
     size: u32,
     offset: u32,
     ranked: bool,
-) -> Result<Vec<T>> {
+) -> Result<Vec<Listing>> {
     let mut request = client.get(format!("{base}/events")).query(&[
         ("active", "true"),
         ("closed", "false"),
@@ -313,7 +353,16 @@ async fn list_page<T: serde::de::DeserializeOwned>(
         "Gamma list page body",
     )
     .await?;
-    Ok(serde_json::from_slice(&body)?)
+    let page: Vec<Listing> = serde_json::from_slice(&body)?;
+    if page.len() > size as usize {
+        return Err(PageOverLimit {
+            size,
+            offset,
+            returned: page.len(),
+        }
+        .into());
+    }
+    Ok(page)
 }
 
 pub async fn popular(client: &Client, base: &str) -> Result<Vec<(Listing, Decimal)>> {
@@ -325,16 +374,12 @@ pub async fn popular(client: &Client, base: &str) -> Result<Vec<(Listing, Decima
     while offset < 120 {
         let page: Vec<Listing> = match list_page(client, base, size, offset, true).await {
             Ok(page) => page,
-            Err(_) if size > 1 => {
+            Err(e) if size > 1 && !e.is::<PageOverLimit>() => {
                 size = 1;
                 continue;
             }
             Err(e) => return Err(e),
         };
-        ensure!(
-            page.len() <= size as usize,
-            "Gamma returned too many events"
-        );
         let last = page.len() < size as usize;
         offset += size;
         size = 3;
@@ -362,7 +407,7 @@ pub async fn popular(client: &Client, base: &str) -> Result<Vec<(Listing, Decima
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_http::{http_request, http_response_with_status};
+    use crate::test_http::{http_request, http_response, http_response_with_status};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -433,6 +478,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_rejects_excess_rows_before_filtering_even_after_a_valid_page() {
+        let client = Client::builder().no_proxy().build().unwrap();
+        for (limit, page_counts, second_is_neg_risk) in [
+            (1, vec![2], true),
+            (1, vec![2], false),
+            (51, vec![50, 2], false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let serve = async {
+                for (index, count) in page_counts.into_iter().enumerate() {
+                    let (socket, request) = http_request(&listener).await;
+                    let size = if limit > 50 && index == 0 { 50 } else { 1 };
+                    let offset = 7 + 50 * index;
+                    assert!(request.contains(&format!("&limit={size}&offset={offset} ")));
+                    let page: Vec<_> = (0..count)
+                        .map(|i| {
+                            serde_json::json!({"slug":format!("event-{i}"),
+                            "title":"Fixture","negRisk":i == 0 || second_is_neg_risk})
+                        })
+                        .collect();
+                    http_response(socket, &serde_json::to_string(&page).unwrap()).await;
+                }
+            };
+            let (result, ()) = tokio::join!(list_from(&client, &base, limit, 7), serve);
+            let error = result
+                .err()
+                .expect("an oversized page must discard the entire result");
+            let offset = if limit == 51 { 57 } else { 7 };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("offset {offset}: requested 1, received 2"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn popular_rejects_oversized_pages_without_the_http_failure_retry() {
+        let client = Client::builder().no_proxy().build().unwrap();
+        for oversized in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let serve = async {
+                let (socket, request) = http_request(&listener).await;
+                assert!(request.contains("&limit=3&offset=0&order=volume24hr"));
+                if oversized {
+                    let event = r#"{"slug":"fixture","title":"Fixture","negRisk":true}"#;
+                    http_response(socket, &format!("[{}]", [event; 4].join(","))).await;
+                } else {
+                    http_response_with_status(socket, "503 Service Unavailable", "{}").await;
+                    let (socket, request) = http_request(&listener).await;
+                    assert!(request.contains("&limit=1&offset=0&order=volume24hr"));
+                    http_response(socket, "[]").await;
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(popular(&client, &base), serve)
+            })
+            .await
+            .expect("ranked pagination must finish without an extra request");
+            if oversized {
+                assert!(result.err().unwrap().is::<PageOverLimit>());
+            } else {
+                assert!(result.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn list_preserves_offsets_page_sizes_and_neg_risk_filter() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -481,9 +596,9 @@ mod tests {
         let group = event
             .into_group(expiration(Duration::from_secs(30)).unwrap())
             .unwrap();
-        assert_eq!(group.markets[0].tokens, ["111", "222"]);
-        assert_eq!(group.markets[0].tick, Decimal::new(1, 28));
-        assert!(group.markets[1].closed);
+        assert_eq!(group.markets()[0].tokens, ["111", "222"]);
+        assert_eq!(group.markets()[0].tick, Decimal::new(1, 28));
+        assert!(group.markets()[1].closed);
     }
 
     #[test]
