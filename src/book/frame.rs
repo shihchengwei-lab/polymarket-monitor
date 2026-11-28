@@ -163,7 +163,7 @@ impl NegRiskEventGroup {
                             staged.book.expire_snapshot();
                         }
                         staged.last = i;
-                        staged.book.update(|b| {
+                        staged.book.update(matches!(edit, Edit::Tick(..)), |b| {
                             ensure!(
                                 market.condition == *condition,
                                 "unexpected condition ID {condition}"
@@ -247,8 +247,10 @@ impl NegRiskEventGroup {
                             book.state = prepared.books.remove(&asset).unwrap().book.state;
                         } else {
                             // All transitions were checked in FIFO order at this commit instant.
-                            book.update(|b| edit.apply(b, at, source, commit))
-                                .expect("prepared book transition");
+                            book.update(matches!(edit, Edit::Tick(..)), |b| {
+                                edit.apply(b, at, source, commit)
+                            })
+                            .expect("prepared book transition");
                         }
                     }
                 }

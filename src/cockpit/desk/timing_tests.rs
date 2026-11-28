@@ -156,10 +156,13 @@ impl Replay {
         self.command_at(0, cmd);
     }
     fn command_at(&mut self, t: u64, cmd: Command) {
+        self.request_at(t, cmd).unwrap();
+    }
+    fn request_at(&mut self, t: u64, cmd: Command) -> Result<(), String> {
         let (tx, mut reply) = oneshot::channel();
         self.commands.try_send((cmd, tx)).unwrap();
         self.clock(t);
-        reply.try_recv().unwrap().unwrap();
+        reply.try_recv().unwrap()
     }
     fn clock(&mut self, t: u64) {
         self.input(t, MarketInput::Clock(self.driver.commands.len()));
@@ -830,52 +833,75 @@ async fn committed_tick_rechecks_price_without_rebuilding_maker_priority() {
     }
 }
 
+fn hedge_offers(r: &mut Replay, t: u64, bid: &str, levels: &[(&str, u32)]) {
+    let level = |(price, size): (&str, u32)| Level {
+        price: price.parse().unwrap(),
+        size: size.into(),
+    };
+    let b = BuyDepth {
+        asset: "2".into(),
+        observed_at: r.driver.origin + Duration::from_millis(t),
+        tick: D::new(1, 4),
+        bid: Some(level((bid, 100))),
+        asks: levels.iter().copied().map(level).collect(),
+    };
+    r.input(t, MarketInput::Offers(committed(&b)));
+    // Price discovery only exposes the first 25 shares. The exchange saw the full side above.
+    let mut legs = r.driver.latest.clone().unwrap().to_vec();
+    let mut b = b;
+    b.asks.truncate(1);
+    legs[1] = Arc::new(b);
+    r.input(t, MarketInput::Depth(Some(legs.into())));
+}
+
+fn completed_first_round() -> Replay {
+    let mut r = Replay::new(true);
+    hedge_offers(&mut r, 20, ".57", &[(".585", 25)]);
+    r.sell(21, "27");
+    r.clock(61);
+    assert_eq!(r.screen()["slots"][0]["shares"], "25");
+    assert_eq!(r.screen()["slots"][1]["shares"], "25");
+    r
+}
+
 #[test]
-fn ioc_replenishes_only_on_a_real_public_size_increase() {
-    fn offers(r: &mut Replay, t: u64, bid: &str, levels: &[(&str, u32)]) {
-        let level = |(price, size): (&str, u32)| Level {
-            price: price.parse().unwrap(),
-            size: size.into(),
-        };
-        let b = BuyDepth {
-            asset: "2".into(),
-            observed_at: r.driver.origin + Duration::from_millis(t),
-            tick: D::new(1, 4),
-            bid: Some(level((bid, 100))),
-            asks: levels.iter().copied().map(level).collect(),
-        };
-        r.input(t, MarketInput::Offers(committed(&b)));
-        // Price discovery only exposes the first 25 shares. The exchange saw the full side above.
-        let mut legs = r.driver.latest.clone().unwrap().to_vec();
-        let mut b = b;
-        b.asks.truncate(1);
-        legs[1] = Arc::new(b);
-        r.input(t, MarketInput::Depth(Some(legs.into())));
-    }
-    for (bid, intermediate, expected) in [
-        (".5700001", vec![], "50"),
-        (".5700001", vec![(".585", 25)], "25"),
-        (".57", vec![], "50"),
-        (".57", vec![(".585", 25)], "25"),
-        (".57", vec![(".58", 25), (".585", 25)], "25"),
+fn second_round_uses_only_remaining_and_replenished_liquidity() {
+    for (intermediate, final_asks, refill) in [
+        (vec![], vec![(".585", 25)], true),
+        (vec![(".585", 25)], vec![(".585", 25)], false),
+        (vec![(".58", 25), (".585", 25)], vec![(".585", 25)], false),
+        (vec![(".585", 25)], vec![(".585", 50)], true),
+        (vec![(".585", 25)], vec![(".585", 25), (".59", 25)], true),
     ] {
-        let mut r = Replay::new(true);
-        offers(&mut r, 20, ".57", &[(".585", 25)]);
-        r.sell(21, "27");
-        r.clock(61);
-        assert_eq!(r.screen()["slots"][1]["shares"], "25");
-        offers(&mut r, 200, bid, &intermediate);
-        offers(&mut r, 201, ".57", &[(".585", 25)]);
-        r.command_at(1200, Command::Fire);
+        let mut r = completed_first_round();
+        hedge_offers(&mut r, 200, ".57", &intermediate);
+        hedge_offers(&mut r, 201, ".57", &final_asks);
+        assert_eq!(r.request_at(1200, Command::Fire).is_ok(), refill);
         r.clock(1220);
         r.sell(1221, "27");
         r.clock(1261);
         let v = r.screen();
-        assert_eq!(v["slots"][0]["shares"], "50");
+        let expected = if refill { "50" } else { "25" };
+        assert_eq!(v["slots"][0]["shares"], expected);
         assert_eq!(v["slots"][1]["shares"], expected);
         assert_eq!(v["frozen"], "0");
         assert_eq!(v["conserved"], true);
     }
+}
+
+#[test]
+fn hedge_preserves_partial_fill_within_the_original_limit() {
+    let mut r = Replay::new(true);
+    hedge_offers(&mut r, 20, ".57", &[(".585", 25)]);
+    r.sell(21, "27");
+    r.clock(41);
+    hedge_offers(&mut r, 42, ".57", &[(".585", 10), (".590", 15)]);
+    r.clock(62);
+    let v = r.screen();
+    assert_eq!(v["slots"][0]["shares"], "25");
+    assert_eq!(v["slots"][1]["shares"], "10");
+    assert_eq!(v["frozen"], "0");
+    assert_eq!(v["conserved"], true);
 }
 
 #[tokio::test]
@@ -1442,6 +1468,9 @@ impl DeadlineMarket {
         assert!(!self.group.advance_input(self.source).unwrap());
     }
     async fn command(&mut self, path: &str) {
+        assert_eq!(self.request(path).await, hyper::StatusCode::OK);
+    }
+    async fn request(&mut self, path: &str) -> hyper::StatusCode {
         let route = {
             let r = self.replay.lock().unwrap();
             super::super::session::Route {
@@ -1461,7 +1490,7 @@ impl DeadlineMarket {
         tokio::pin!(command);
         assert!(futures_util::poll!(&mut command).is_pending());
         self.idle();
-        assert_eq!(command.await.status(), hyper::StatusCode::OK);
+        command.await.status()
     }
     fn sell(&mut self) {
         self.frame(json!({"event_type":"last_trade_price","asset_id":"1","price":".40","size":"7","side":"SELL","timestamp":"1"}));
@@ -1482,6 +1511,126 @@ impl DeadlineMarket {
         self.sell();
         self.at(cancel_us + 40_000).await;
         self.idle();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn second_round_http_checks_effective_depth_at_entry_and_delivery() {
+    let hedge_book = |timestamp, size| {
+        json!({
+            "event_type":"book","market":"b","asset_id":"2","timestamp":timestamp,
+            "bids":[{"price":"0.57","size":"100"}],"asks":[{"price":"0.585","size":size}]
+        })
+    };
+    for (size, drop_before_delivery) in [("25", false), ("50", true), ("50", false)] {
+        let mut m = DeadlineMarket::new(0, 0, 0).await;
+        m.frame(hedge_book("2", "25"));
+        m.command("/desk/lag/20").await;
+        m.command("/desk/fire").await;
+        m.at(20_000).await;
+        m.idle();
+        m.at(21_000).await;
+        m.frame(
+            json!({"event_type":"last_trade_price","market":"a","asset_id":"1",
+            "price":"0.40","size":"27","side":"SELL","timestamp":"1"}),
+        );
+        m.at(61_000).await;
+        m.idle();
+        let first = m.view().await;
+        assert_eq!(first["slots"][0]["shares"], "25");
+        assert_eq!(first["slots"][1]["shares"], "25");
+
+        m.at(201_000).await;
+        m.frame(hedge_book("3", size));
+        m.at(1_200_000).await;
+        let status = m.request("/desk/fire").await;
+        assert_eq!(
+            status,
+            if size == "25" {
+                hyper::StatusCode::CONFLICT
+            } else {
+                hyper::StatusCode::OK
+            }
+        );
+        if drop_before_delivery {
+            m.at(1_210_000).await;
+            m.frame(hedge_book("4", "49"));
+        }
+        m.at(1_220_000).await;
+        m.idle();
+        let delivered = m.view().await;
+        let replenished = size == "50" && !drop_before_delivery;
+        assert_eq!(delivered["queue"].is_object(), replenished);
+        assert_eq!(
+            dec(&delivered["frozen"]).unwrap(),
+            if replenished { D::TEN } else { D::ZERO }
+        );
+        if drop_before_delivery {
+            assert!(delivered["log"].to_string().contains("可見補腿深度不足"));
+        }
+        m.at(1_221_000).await;
+        m.frame(
+            json!({"event_type":"last_trade_price","market":"a","asset_id":"1",
+            "price":"0.40","size":"27","side":"SELL","timestamp":"2"}),
+        );
+        m.at(1_261_000).await;
+        m.idle();
+        let final_view = m.view().await;
+        let shares = if replenished { "50" } else { "25" };
+        assert_eq!(final_view["slots"][0]["shares"], shares);
+        assert_eq!(final_view["slots"][1]["shares"], shares);
+        assert_eq!(dec(&final_view["frozen"]).unwrap(), D::ZERO);
+        assert_eq!(final_view["conserved"], true);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_isolation_tick_closes_only_off_grid_cockpit_orders() {
+    use crate::test_http::{coarse_tick, full_book_at_capacity, overflow_full_book};
+
+    for (bid, off_grid) in [("0.41", true), ("0.40", false)] {
+        let mut m = DeadlineMarket::new(0, 0, 0).await;
+        m.frame(
+            json!({"event_type":"book","market":"a","asset_id":"1","timestamp":"100",
+            "bids":[{"price":bid,"size":"2"}],"asks":[{"price":"0.60","size":"100"}]}),
+        );
+        m.command("/desk/lag/20").await;
+        m.command("/desk/fire").await;
+        m.at(20_000).await;
+        m.idle();
+        let frozen: D = (if off_grid { "10.25" } else { "10" }).parse().unwrap();
+        assert_eq!(dec(&m.view().await["frozen"]).unwrap(), frozen);
+
+        m.at(30_000).await;
+        m.frame(full_book_at_capacity(bid));
+        assert!(m.group.ready());
+        m.at(31_000).await;
+        m.frame(overflow_full_book());
+        assert!(!m.group.ready());
+        assert_eq!(
+            dec(&m.replay.lock().unwrap().screen()["frozen"]).unwrap(),
+            frozen
+        );
+
+        m.at(32_000).await;
+        m.frame(coarse_tick());
+        m.sell(); // The isolated order book must not match even at the retained price.
+        assert!(!m.group.ready());
+        m.at(130_000).await;
+        m.idle();
+        let v = m.view().await;
+        assert_eq!(v["slots"][0]["shares"], "0");
+        assert_eq!(v["conserved"], true);
+        if off_grid {
+            assert_eq!(
+                v["orders"][0],
+                json!({"order_id":1,"reason":"tick_changed","effective_ms":32,"filled":"0"})
+            );
+            assert_eq!(v["frozen"], "0");
+        } else {
+            assert_eq!(v["queue"]["remaining"], "2");
+            assert_eq!(dec(&v["frozen"]).unwrap(), D::TEN);
+        }
     }
 }
 

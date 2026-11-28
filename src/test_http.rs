@@ -36,3 +36,24 @@ pub(crate) async fn http_response_with_status(mut socket: TcpStream, status: &st
     socket.write_all(response.as_bytes()).await.unwrap();
     socket.shutdown().await.unwrap();
 }
+
+// Prices stay on the original .0001 grid, including all 4,096 active levels.
+pub(crate) fn full_book_at_capacity(best_bid: &str) -> serde_json::Value {
+    use serde_json::json;
+    let level = |index| json!({"price":format!("0.{index:04}"),"size":"1"});
+    let mut bids: Vec<_> = (1..=2095).map(level).collect();
+    bids.push(json!({"price":best_bid,"size":"2"}));
+    let mut asks: Vec<_> = (6001..=7999).map(level).collect();
+    asks.push(json!({"price":"0.60","size":"100"}));
+    json!({"event_type":"book","market":"a","asset_id":"1","timestamp":"101","bids":bids,"asks":asks})
+}
+
+pub(crate) fn overflow_full_book() -> serde_json::Value {
+    serde_json::json!({"event_type":"price_change","market":"a","timestamp":"102",
+        "price_changes":[{"asset_id":"1","side":"SELL","price":"0.8000","size":"1"}]})
+}
+
+pub(crate) fn coarse_tick() -> serde_json::Value {
+    serde_json::json!({"event_type":"tick_size_change","market":"a","asset_id":"1",
+        "timestamp":"103","new_tick_size":"0.10"})
+}

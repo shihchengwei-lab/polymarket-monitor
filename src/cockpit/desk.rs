@@ -118,23 +118,6 @@ async fn roster(client: &Client, slug: &str, gamma: &str, clob: &str) -> Result<
 struct Quote {
     bid: Price,
     ahead: D,
-    asks: Vec<(Price, Quantity)>,
-    tick: Price,
-}
-
-impl Quote {
-    fn sweep_cost(&self, mut left: D, fee: FeeModel) -> Result<D> {
-        let mut cost = D::ZERO;
-        for &(price, available) in &self.asks {
-            let take = available.shares().decimal().min(left);
-            cost += take * price.decimal() + fee.taker_fee(price, Shares::new(take)?).decimal();
-            left -= take;
-            if left.is_zero() {
-                return Ok(cost);
-            }
-        }
-        anyhow::bail!("可見補腿深度不足")
-    }
 }
 
 fn quotes(update: BasketUpdate, legs: &[Leg], now: Instant) -> Option<(Vec<Quote>, Instant)> {
@@ -151,24 +134,18 @@ fn quotes(update: BasketUpdate, legs: &[Leg], now: Instant) -> Option<(Vec<Quote
         .map(|l| {
             let b = books.iter().find(|b| b.asset == l.asset.as_str())?;
             let bid = b.bid?;
-            let asks = b
-                .asks
-                .iter()
-                .map(|v| {
-                    Some((
-                        Price::new(v.price).ok()?,
-                        Quantity::new(v.size.min(D::from(1_000_000))).ok()?,
-                    ))
+            Price::new(b.tick).ok()?;
+            if b.asks.is_empty()
+                || b.asks.iter().any(|v| {
+                    Price::new(v.price).is_err()
+                        || Quantity::new(v.size.min(D::from(1_000_000))).is_err()
                 })
-                .collect::<Option<Vec<_>>>()?;
-            if asks.is_empty() {
+            {
                 return None;
             }
             Some(Quote {
                 bid: Price::new(bid.price).ok()?,
                 ahead: bid.size,
-                asks,
-                tick: Price::new(b.tick).ok()?,
             })
         })
         .collect::<Option<_>>()?;
@@ -328,19 +305,32 @@ impl Desk {
         }
     }
     fn cost(&self, i: usize, resting_price: Price) -> Result<D> {
-        let qs = self.quotes.as_ref().context("行情尚未就緒")?;
+        self.quotes.as_ref().context("行情尚未就緒")?;
         let n = D::from(SIZE);
+        let shares = Shares::new(n)?;
         // This paper account uses MakerTier::None, so its expected rebate is zero.
         let rebate = self.legs[i]
             .fee
-            .maker_rebate(MakerTier::None, resting_price, Shares::new(n)?);
+            .maker_rebate(MakerTier::None, resting_price, shares);
         let mut cost = n * resting_price.decimal() - rebate.decimal();
-        for (j, q) in qs.iter().enumerate() {
-            ensure!(n >= self.legs[j].minimum, "未達最小股數");
+        for (j, leg) in self.legs.iter().enumerate() {
+            ensure!(n >= leg.minimum, "未達最小股數");
             if i != j {
-                cost += q.sweep_cost(n, self.legs[j].fee)?;
+                let estimate = self
+                    .ex
+                    .estimate_buy(&leg.asset, shares)
+                    .filter(|estimate| estimate.shares == shares)
+                    .context("可見補腿深度不足")?;
+                cost += estimate.cost;
             }
         }
+        Ok(cost)
+    }
+
+    fn entry_cost(&self, leg: usize, bid: Price, force: bool) -> Result<D> {
+        let cost = self.cost(leg, bid)?;
+        ensure!(force || cost < D::from(SIZE), "含費成本未低於 25");
+        ensure!(self.balance(leg)?.cash().decimal() >= cost, "可用現金不足");
         Ok(cost)
     }
 
@@ -396,9 +386,7 @@ impl Desk {
             .min_by_key(|(_, q)| q.ahead)
             .context("無有效市場")?;
         ensure!(q.ahead <= D::from(1_000_000), "前方隊列超出紙上引擎容量");
-        let cost = self.cost(i, q.bid)?;
-        ensure!(force || cost < D::from(SIZE), "含費成本未低於 25");
-        ensure!(self.balance(i)?.cash().decimal() >= cost, "可用現金不足");
+        let cost = self.entry_cost(i, q.bid, force)?;
         self.round = Some(Round::Sending {
             leg: i,
             quote: q.clone(),
@@ -464,11 +452,8 @@ impl Desk {
                 force,
             } if t >= due => {
                 let q = self.quotes.as_ref().context("掛單送達時盤面失效")?[leg].clone();
-                let cost = self.cost(leg, quote.bid)?;
-                ensure!(
-                    q.bid == quote.bid && (cost < D::from(SIZE) || force),
-                    "送達時掛價或閘門失效"
-                );
+                ensure!(q.bid == quote.bid, "送達時掛價失效");
+                let cost = self.entry_cost(leg, quote.bid, force)?;
                 ensure!(q.ahead <= D::from(1_000_000), "前方隊列超出紙上引擎容量");
                 let (key, status) = self.submit(leg, q.bid, SIZE.into(), OrderMode::PostOnly)?;
                 ensure!(
@@ -553,11 +538,12 @@ impl Desk {
                     }
                     if let Some(reason) = self.fee_block {
                         self.reject_hedge(i, filled, reason, t);
-                    } else if let Some(limit) = self.ex.hedge_limit(&self.legs[i].asset, confirmed)
+                    } else if let Some(estimate) =
+                        self.ex.estimate_buy(&self.legs[i].asset, confirmed)
                     {
                         orders.push(Hedge {
                             leg: i,
-                            limit,
+                            limit: estimate.limit,
                             due: t + self.lag + self.legs[i].delay,
                         });
                     } else {
@@ -1176,44 +1162,39 @@ mod tests {
         d.quotes = Some(vec![
             Quote {
                 bid: price(".40"),
-                asks: vec![(price(".41"), Quantity::new(100.into()).unwrap())],
                 ahead: 2.into(),
-                tick: price(".01"),
             },
             Quote {
                 bid: price(".58"),
-                asks: vec![(price(".59"), Quantity::new(100.into()).unwrap())],
                 ahead: 100.into(),
-                tick: price(".01"),
             },
         ]);
-        commit_fixture(&mut d, 0);
+        commit_fixture(&mut d, 0, 0, ".01", &[(".41", 100)]);
+        commit_fixture(&mut d, 0, 1, ".01", &[(".59", 100)]);
         d
     }
-    fn commit_fixture(d: &mut Desk, t: u64) {
-        for (leg, q) in d.quotes.clone().unwrap().into_iter().enumerate() {
-            use crate::wire::Level;
-            let book = crate::book::BuyDepth {
-                asset: d.legs[leg].asset.as_str().into(),
-                observed_at: d.ex.live_time_for_test(t),
-                tick: q.tick.decimal(),
-                bid: Some(Level {
-                    price: q.bid.decimal(),
-                    size: q.ahead,
-                }),
-                asks: q
-                    .asks
-                    .into_iter()
-                    .map(|(p, n)| Level {
-                        price: p.decimal(),
-                        size: n.shares().decimal(),
-                    })
-                    .collect(),
-            };
-            d.ex.advance_to(t).unwrap();
-            d.commit_offers(super::timing_tests::committed(&book))
-                .unwrap();
-        }
+    fn commit_fixture(d: &mut Desk, t: u64, leg: usize, tick: &str, asks: &[(&str, u32)]) {
+        use crate::wire::Level;
+        let q = &d.quotes.as_ref().unwrap()[leg];
+        let book = crate::book::BuyDepth {
+            asset: d.legs[leg].asset.as_str().into(),
+            observed_at: d.ex.live_time_for_test(t),
+            tick: tick.parse().unwrap(),
+            bid: Some(Level {
+                price: q.bid.decimal(),
+                size: q.ahead,
+            }),
+            asks: asks
+                .iter()
+                .map(|(p, n)| Level {
+                    price: p.parse().unwrap(),
+                    size: (*n).into(),
+                })
+                .collect(),
+        };
+        d.ex.advance_to(t).unwrap();
+        d.commit_offers(super::timing_tests::committed(&book))
+            .unwrap();
     }
     fn sell(d: &mut Desk, t: u64, size: &str) {
         d.print(
@@ -1230,9 +1211,9 @@ mod tests {
         let mut d = desk();
         d.lag = 100;
         assert!(d.start(0, false).is_err()); // 0.99 before fees, over 1 after fees
-        d.quotes.as_mut().unwrap()[1].asks[0].1 = Quantity::new(24.into()).unwrap();
+        commit_fixture(&mut d, 0, 1, ".01", &[(".59", 24)]);
         assert!(d.start(0, true).is_err());
-        d.quotes.as_mut().unwrap()[1].asks[0].1 = Quantity::new(100.into()).unwrap();
+        commit_fixture(&mut d, 0, 1, ".01", &[(".59", 100)]);
         d.start(0, true).unwrap();
         assert!(d.start(1, true).is_err());
         d.step(99).unwrap();
@@ -1250,7 +1231,7 @@ mod tests {
         assert_eq!(snap["markers"][1]["kind"], "部分成交");
         assert_eq!(snap["slots"][0]["shares"], "5");
         assert_eq!(snap["slots"][1]["shares"], "0");
-        d.quotes.as_mut().unwrap()[1].asks[0].0 = price(".61");
+        commit_fixture(&mut d, 115, 1, ".01", &[(".61", 100)]);
         d.step(115).unwrap();
         sell(&mut d, 180, "3");
         d.step(215).unwrap(); // cancel acknowledges 8
@@ -1279,23 +1260,15 @@ mod tests {
         let mut d = desk_with_fee(D::ZERO);
         d.auto = true;
         d.lag = 20;
-        let q = &mut d.quotes.as_mut().unwrap()[1];
-        q.tick = price(".001");
-        q.asks = vec![(price(".585"), Quantity::new(25.into()).unwrap())];
+        commit_fixture(&mut d, 0, 1, ".001", &[(".585", 25)]);
         let n = D::from(SIZE);
         assert_eq!(d.cost(0, price(".40")).unwrap() / n, D::new(985, 3));
         d.start(0, false).unwrap();
         d.step(20).unwrap();
         // Five shares remain cheap. Buying the deeper twenty removes the edge.
-        d.quotes.as_mut().unwrap()[1].asks = vec![
-            (price(".58"), Quantity::new(5.into()).unwrap()),
-            (price(".6075"), Quantity::new(20.into()).unwrap()),
-        ];
-        let q = &mut d.quotes.as_mut().unwrap()[1];
-        q.bid = price(".57");
-        q.tick = price(".0001");
+        d.quotes.as_mut().unwrap()[1].bid = price(".57");
+        commit_fixture(&mut d, 80, 1, ".0001", &[(".58", 5), (".6075", 20)]);
         assert_eq!(d.cost(0, price(".40")).unwrap() / n, D::new(1002, 3));
-        commit_fixture(&mut d, 80);
         d.check_cancel(80).unwrap();
         assert_eq!(d.screen()["cancellations"][0]["outcome"], "pending");
         d.check_cancel(81).unwrap();
@@ -1342,16 +1315,16 @@ mod tests {
         for timeout in [true, false] {
             let mut d = desk_with_fee(D::ZERO);
             d.lag = 10;
-            d.quotes.as_mut().unwrap()[1].asks[0].0 = price(".62");
+            commit_fixture(&mut d, 0, 1, ".01", &[(".62", 100)]);
             d.start(0, true).unwrap();
             d.step(10).unwrap();
-            d.quotes.as_mut().unwrap()[1].asks[0].0 = price(".63");
+            commit_fixture(&mut d, 11, 1, ".01", &[(".63", 100)]);
             d.check_cancel(20_009).unwrap();
             assert!(d.screen()["cancellations"].as_array().unwrap().is_empty());
             if timeout {
                 d.check_cancel(20_010).unwrap();
             } else {
-                d.quotes.as_mut().unwrap()[1].asks[0].0 = price(".631");
+                commit_fixture(&mut d, 20_009, 1, ".001", &[(".631", 100)]);
                 d.check_cancel(20_009).unwrap();
             }
             assert!(d.log.back().unwrap().contains(if timeout {
@@ -1385,8 +1358,7 @@ mod tests {
         sell(&mut d, 11, "27");
         d.step(11).unwrap();
         d.step(21).unwrap();
-        d.quotes.as_mut().unwrap()[1].asks[0].0 = price(".60");
-        commit_fixture(&mut d, 30);
+        commit_fixture(&mut d, 30, 1, ".01", &[(".60", 100)]);
         d.step(31).unwrap();
         assert_eq!(d.balance(0).unwrap().shares().decimal(), D::from(25));
         assert_eq!(d.balance(1).unwrap().shares(), Shares::ZERO);

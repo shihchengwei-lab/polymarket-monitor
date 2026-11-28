@@ -149,6 +149,7 @@ pub(crate) enum BidObservation {
     Available(Option<Level>),
     Full(Option<Vec<Level>>),
     Suspended,
+    Unavailable,
 }
 impl CommittedBook {
     pub fn asset(&self) -> &str {
@@ -280,11 +281,22 @@ impl DisconnectReason {
 #[derive(Clone)]
 enum BookState {
     Disconnected(DisconnectReason),
-    Syncing { timestamp: u64, tick: Decimal },
+    Syncing {
+        timestamp: u64,
+        tick: Decimal,
+    },
     Synced(BookData),
-    Reconciling { book: BookData, deadline: Instant },
+    Reconciling {
+        book: BookData,
+        deadline: Instant,
+    },
     Stale,
-    StaleOverCapacity,
+    StaleOverCapacity {
+        observed_at: Instant,
+        timestamp: u64,
+        revision: BookRevision,
+        tick: Decimal,
+    },
 }
 
 #[derive(Clone)]
@@ -301,6 +313,23 @@ impl TokenBook {
         full: bool,
         previous: Option<(u64, u64)>,
     ) -> Option<CommittedBook> {
+        if let BookState::StaleOverCapacity {
+            observed_at,
+            revision,
+            tick,
+            ..
+        } = self.state
+        {
+            return (previous != Some((source.id, revision.number()))).then(|| CommittedBook {
+                observed_at,
+                subscription: source,
+                revision,
+                asset: self.asset.clone(),
+                tick,
+                bid: BidObservation::Unavailable,
+                asks: Vec::new(),
+            });
+        }
         let (book, available) = match &self.state {
             BookState::Synced(book) => (book, true),
             BookState::Reconciling { book, .. } => (book, false),
@@ -350,7 +379,9 @@ impl TokenBook {
         self.state = match self.state {
             BookState::Syncing { .. } => BookState::Disconnected(DisconnectReason::Clean),
             BookState::Synced(_) | BookState::Reconciling { .. } => BookState::Stale,
-            BookState::Disconnected(_) | BookState::Stale | BookState::StaleOverCapacity => return,
+            BookState::Disconnected(_) | BookState::Stale | BookState::StaleOverCapacity { .. } => {
+                return;
+            }
         };
     }
 
@@ -366,7 +397,7 @@ impl TokenBook {
     fn bootstrap_failure(&self) -> Option<&'static str> {
         match &self.state {
             BookState::Disconnected(reason) => reason.bootstrap_failure(),
-            BookState::StaleOverCapacity => DisconnectReason::Capacity.bootstrap_failure(),
+            BookState::StaleOverCapacity { .. } => DisconnectReason::Capacity.bootstrap_failure(),
             _ => None,
         }
     }
@@ -403,12 +434,26 @@ impl TokenBook {
             snapshot.timestamp >= previous,
             "WebSocket snapshot went backwards"
         );
+        let revision = BookRevision::Depth(revision);
+        let overflow = if initial {
+            BookState::Disconnected(DisconnectReason::Capacity)
+        } else {
+            BookState::StaleOverCapacity {
+                observed_at: received_at,
+                timestamp: snapshot.timestamp,
+                revision,
+                tick,
+            }
+        };
+        let Some(levels) = self.checked_levels(levels, overflow)? else {
+            return Ok(());
+        };
         let book = BookData {
             projection: OnceLock::new(),
             observed_at: received_at,
-            levels: levels?,
+            levels,
             timestamp: snapshot.timestamp,
-            revision: BookRevision::Depth(revision),
+            revision,
             tick,
         };
         let pending = match self.state {
@@ -465,13 +510,25 @@ impl TokenBook {
                     .last()
                     .and_then(|c| c.best_bid.zip(c.best_ask))
                     .is_some_and(|(b, a)| Decimal::ZERO < b && b < a && a < Decimal::ONE);
-                book.levels = book
-                    .levels
-                    .apply(changes.iter().map(|c| (c.side, c.level)))?;
+                let revision = BookRevision::Depth(book.revision.number() + 1);
+                let levels = book.levels.apply(changes.iter().map(|c| (c.side, c.level)));
+                let Some(levels) = self.checked_levels(
+                    levels,
+                    BookState::StaleOverCapacity {
+                        observed_at: received_at,
+                        timestamp,
+                        revision,
+                        tick: book.tick,
+                    },
+                )?
+                else {
+                    return Ok(());
+                };
+                book.levels = levels;
                 book.projection.take();
                 book.observed_at = received_at;
                 book.timestamp = timestamp;
-                book.revision = BookRevision::Depth(book.revision.number() + 1);
+                book.revision = revision;
                 let validation = book.levels.validate();
                 let crossed = validation.is_err();
                 if !official_open {
@@ -487,29 +544,31 @@ impl TokenBook {
         Ok(())
     }
 
-    fn update(&mut self, apply: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        if self.quarantined() {
+    fn checked_levels(
+        &mut self,
+        result: Result<Levels>,
+        overflow: BookState,
+    ) -> Result<Option<Levels>> {
+        match result {
+            Err(err) if err.is::<DepthLimit>() => {
+                self.state = overflow;
+                Ok(None)
+            }
+            result => result.map(Some),
+        }
+    }
+
+    fn update(&mut self, is_tick: bool, apply: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        if self.quarantined()
+            && !(is_tick && matches!(self.state, BookState::StaleOverCapacity { .. }))
+        {
             return Ok(());
         }
-        let was_synced = matches!(
-            self.state,
-            BookState::Synced(_) | BookState::Reconciling { .. }
-        );
-        match apply(self) {
-            Err(err) if err.is::<DepthLimit>() => {
-                self.state = if was_synced {
-                    BookState::StaleOverCapacity
-                } else {
-                    BookState::Disconnected(DisconnectReason::Capacity)
-                };
-                Ok(())
-            }
-            Err(err) => {
-                self.invalidate();
-                bail!("token {}: {err}", self.asset);
-            }
-            Ok(()) => Ok(()),
+        if let Err(err) = apply(self) {
+            self.invalidate();
+            bail!("token {}: {err}", self.asset);
         }
+        Ok(())
     }
 
     fn tick(&mut self, timestamp: u64, tick: Decimal) -> Result<()> {
@@ -539,6 +598,22 @@ impl TokenBook {
                 }
                 book.timestamp = timestamp;
             }
+            BookState::StaleOverCapacity {
+                timestamp: previous,
+                tick: current,
+                revision,
+                ..
+            } => {
+                ensure!(
+                    timestamp >= *previous,
+                    "WebSocket tick change went backwards"
+                );
+                if *current != tick {
+                    *revision = BookRevision::Tick(revision.number() + 1);
+                    *current = tick;
+                }
+                *previous = timestamp;
+            }
             _ => {}
         }
         Ok(())
@@ -551,7 +626,7 @@ impl TokenBook {
             BookState::Synced(_) => "Synced",
             BookState::Reconciling { .. } => "Reconciling",
             BookState::Stale => "Stale",
-            BookState::StaleOverCapacity => "Stale [價位數超限，本次連線隔離]",
+            BookState::StaleOverCapacity { .. } => "Stale [價位數超限，本次連線隔離]",
             BookState::Disconnected(DisconnectReason::AmbiguousSnapshot) => {
                 "Disconnected [首張快照順序不明，本次連線隔離]"
             }
@@ -1003,11 +1078,19 @@ impl NegRiskEventGroup {
         for market in &mut roster.markets {
             let token = &mut market.yes;
             if let Some(book) = token.committed(source, false, token.published) {
-                token.published = Some(book.version());
-                consumer(at, MarketInput::Offers(Arc::new(book)));
+                let previous = token.published.replace(book.version());
+                if matches!(book.bid, BidObservation::Unavailable) && !book.tick_revision() {
+                    if let Some((generation, _)) = previous {
+                        consumer(at, MarketInput::AssetUnavailable(&token.asset, generation));
+                    }
+                } else {
+                    consumer(at, MarketInput::Offers(Arc::new(book)));
+                }
             } else if !matches!(
                 token.state,
-                BookState::Synced(_) | BookState::Reconciling { .. }
+                BookState::Synced(_)
+                    | BookState::Reconciling { .. }
+                    | BookState::StaleOverCapacity { .. }
             ) && let Some((generation, _)) = token.published.take()
             {
                 consumer(at, MarketInput::AssetUnavailable(&token.asset, generation));
@@ -1514,7 +1597,7 @@ impl NegRiskEventGroup {
             Outcome::Yes => &mut market.yes,
             Outcome::No => &mut market.no,
         };
-        book.update(|book| {
+        book.update(false, |book| {
             ensure!(
                 expected_condition == condition,
                 "unexpected condition ID {condition}"
@@ -2569,6 +2652,94 @@ mod tests {
                     ..
                 })
             ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_isolation_tick_reaches_attached_paper_after_frame_validation() {
+        use crate::paper::{
+            ClientOrderId, Price, Quantity, Shares, Side,
+            order_fsm::{CloseReason, Delivery, OrderMode, OrderRequest, OrderStatus},
+        };
+        use crate::test_http::{coarse_tick, full_book_at_capacity, overflow_full_book};
+
+        for invalid_frame in [false, true] {
+            let mut group = open_group();
+            let source = group.open_input().unwrap();
+            let receive = |group: &mut NegRiskEventGroup, wire: String| {
+                assert!(group.admit_raw(source, wire).unwrap());
+                group.advance_input(source)
+            };
+            receive(&mut group, r#"{"event_type":"tick_size_change","market":"a","asset_id":"1","timestamp":"1","new_tick_size":"0.0001"}"#.into()).unwrap();
+            for (asset, market) in [("1", "a"), ("2", "a"), ("3", "b"), ("4", "b")] {
+                receive(&mut group, snapshot(asset, market, 100)).unwrap();
+            }
+            let (mut group, account, asset) = fund(group);
+            let mut desk = group.paper().unwrap();
+            let stamp = desk.current_stamp(&asset).unwrap().unwrap();
+            let [off_grid, aligned] = [41, 40].map(|cents| {
+                let request = OrderRequest::new(
+                    ClientOrderId::new(cents).unwrap(),
+                    account,
+                    asset.clone(),
+                    Side::Buy,
+                    Price::new(Decimal::new(cents as i64, 2)).unwrap(),
+                    Quantity::new(Decimal::ONE).unwrap(),
+                    OrderMode::PostOnly,
+                );
+                desk.submit(request, stamp, Delivery::Delivered)
+                    .unwrap()
+                    .key()
+            });
+            receive(&mut group, full_book_at_capacity("0.41").to_string()).unwrap();
+            assert!(group.ready());
+            for key in [aligned, off_grid] {
+                assert!(matches!(
+                    group.paper().unwrap().order_status(key),
+                    Ok(OrderStatus::Working { .. })
+                ));
+            }
+            receive(&mut group, overflow_full_book().to_string()).unwrap();
+            assert!(!group.ready());
+            let mut desk = group.paper().unwrap();
+            assert_eq!(desk.current_stamp(&asset), Ok(None));
+            assert_eq!(
+                desk.balance(account, &asset).unwrap().cash().decimal(),
+                Decimal::new(919, 2)
+            );
+
+            let tick = coarse_tick();
+            if invalid_frame {
+                let frame = serde_json::json!([tick, {"event_type":"last_trade_price","asset_id":"1",
+                    "price":"0.41","size":"-1","side":"SELL","timestamp":"104"}]);
+                assert!(receive(&mut group, frame.to_string()).is_err());
+                assert!(!matches!(
+                    group.paper().unwrap().order_status(off_grid),
+                    Ok(OrderStatus::Closed {
+                        reason: CloseReason::TickChanged,
+                        ..
+                    })
+                ));
+                continue;
+            }
+            receive(&mut group, tick.to_string()).unwrap();
+            let mut desk = group.paper().unwrap();
+            assert_eq!(desk.current_stamp(&asset), Ok(None));
+            assert_eq!(
+                desk.order_status(off_grid),
+                Ok(OrderStatus::Closed {
+                    filled: Shares::ZERO,
+                    reason: CloseReason::TickChanged,
+                })
+            );
+            assert!(matches!(
+                desk.order_status(aligned),
+                Ok(OrderStatus::Working { .. })
+            ));
+            assert_eq!(
+                desk.balance(account, &asset).unwrap().cash().decimal(),
+                Decimal::new(96, 1)
+            );
         }
     }
 

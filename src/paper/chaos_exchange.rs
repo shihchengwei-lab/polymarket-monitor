@@ -21,6 +21,12 @@ pub const MAX_DEPTH: usize = 4096;
 const DAY_MS: u64 = 86_400_000;
 static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) struct BuyEstimate {
+    pub shares: Shares,
+    pub limit: Price,
+    pub cost: rust_decimal::Decimal,
+}
+
 /// A validated, full L2 observation. Sequence and age are checked on admission.
 pub struct Depth {
     asset: AssetId,
@@ -657,30 +663,49 @@ impl ChaosExchange {
         self.markets[asset].last_commit
     }
 
-    /// Limit covering the confirmed quantity, or the deepest available partial fill.
-    pub(crate) fn hedge_limit(&self, asset: &AssetId, quantity: Shares) -> Option<Price> {
-        let book = self
-            .markets
-            .get(asset)?
-            .active()
-            .filter(|book| self.fresh(book.observed))?;
+    /// Price-priority estimate from the same external liquidity an IOC can consume.
+    pub(crate) fn estimate_buy(&self, asset: &AssetId, quantity: Shares) -> Option<BuyEstimate> {
+        let market = self.markets.get(asset)?;
+        let book = market.active().filter(|book| self.fresh(book.observed))?;
         let mut left = quantity.micros();
+        let mut cost = rust_decimal::Decimal::ZERO;
         let mut limit = None;
         for (&price, level) in &book.asks {
+            let mut filled = 0;
+            let mut blocked = false;
             for lot in &level.fifo {
-                if let Liquidity::External { available, .. } = lot
-                    && *available > 0
-                {
-                    limit = Some(price);
-                    left = left.saturating_sub(*available);
-                    if left == 0 {
-                        return limit;
+                match lot {
+                    Liquidity::External { available, .. } => {
+                        let take = (left - filled).min(*available);
+                        filled += take;
+                        if filled == left {
+                            break;
+                        }
+                    }
+                    Liquidity::Paper(_) => {
+                        blocked = true;
+                        break;
                     }
                 }
             }
+            if filled != 0 {
+                let shares = Shares::from_micros(filled);
+                cost +=
+                    price.value(shares).decimal() + market.fee.taker_fee(price, shares).decimal();
+                left -= filled;
+                limit = Some(price);
+            }
+            if left == 0 || blocked {
+                break;
+            }
         }
-        limit
+        limit.map(|limit| BuyEstimate {
+            shares: Shares::from_micros(quantity.micros() - left),
+            limit,
+            cost,
+        })
     }
+
     pub fn current_stamp(&self, asset: &AssetId) -> Result<Option<Stamp>, Error> {
         let market = self.markets.get(asset).ok_or(Error::UnknownAsset)?;
         if let DepthState::Rejected(reason) = market.depth {
@@ -743,6 +768,12 @@ impl ChaosExchange {
             latest: observed,
             observed,
         });
+        if matches!(bid, crate::book::BidObservation::Unavailable) {
+            next.tick = tick;
+            market.depth = DepthState::Suspended(next);
+            self.revalidate_orders(&asset, raw_tick);
+            return Ok(());
+        }
         if let crate::book::BidObservation::Full(bids) = bid {
             let convert = |levels: &[crate::wire::Level]| {
                 levels
